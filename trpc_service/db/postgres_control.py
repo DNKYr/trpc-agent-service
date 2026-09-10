@@ -352,6 +352,28 @@ class PostgresControlPlane:
             ).fetchone()
         return self._binding(self._one(row, f"binding {binding_id!r} does not exist"))
 
+    def bindings_for_provider(self, provider: str) -> list[Binding]:
+        """List active bindings through per-tenant RLS transactions.
+
+        The dispatcher first reads the scheduler-only tenant locator, then each
+        channel row is read under that tenant's normal RLS context.  This keeps
+        a connection gateway from getting a broad unscoped channel-table grant.
+        """
+
+        bindings: list[Binding] = []
+        for tenant_id in self.tenant_ids():
+            with self._connections.tenant(_context(tenant_id, "channel-gateway")) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM channel_binding
+                    WHERE provider = %s AND status = 'active'
+                    ORDER BY binding_id
+                    """,
+                    (provider,),
+                ).fetchall()
+            bindings.extend(self._binding(row) for row in rows)
+        return bindings
+
     def resolve_callback_binding(self, provider: str, webhook_key: str) -> Binding:
         with self._connections.bootstrap() as connection:
             row = connection.execute(

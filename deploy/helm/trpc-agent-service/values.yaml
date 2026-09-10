@@ -19,6 +19,7 @@ secrets:
       databaseUrl: prod/trpc-agent/database-url
       redisUrl: prod/trpc-agent/redis-url
       agentApiKey: prod/trpc-agent/model-api-key
+      wecomAibotSecret: prod/trpc-agent/wecom-aibot-secret
 
 config:
   runtimeBackend: postgres
@@ -54,6 +55,15 @@ worker:
 
 dispatcher:
   replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+wecomAibot:
+  # The gateway is opt-in because it owns a persistent connection and requires
+  # TRPC_LIVE_WECOM_AIBOT_SECRET in the referenced Secret.
+  enabled: false
+  replicas: 1
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: 500m, memory: 512Mi}

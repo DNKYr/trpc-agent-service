@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, is_dataclass
 from hashlib import sha256
+from secrets import token_urlsafe
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from trpc_service.agent import AgentFactory, ImmutableRelease
 from trpc_service.channels import (
+    AIBotRegistry,
     CallbackRequest,
     ChannelBinding,
     ChannelError,
@@ -20,6 +22,8 @@ from trpc_service.channels import (
     ReplyEnvelope,
     TelegramAdapter,
     WeComAdapter,
+    WeComAIBotAdapter,
+    WeComAIBotSupervisor,
 )
 from trpc_service.config import (
     AppSettings,
@@ -118,6 +122,7 @@ class ServiceContainer:
     secrets: Any = field(init=False)
     agent_factory: AgentFactory = field(init=False)
     adapters: dict[str, Any] = field(init=False)
+    aibot_registry: AIBotRegistry = field(init=False)
     principal_filter: PrincipalFilter = field(default_factory=PrincipalFilter)
     rate_limit_filter: RateLimitFilter = field(default_factory=RateLimitFilter)
     budget_filter: BudgetFilter = field(default_factory=BudgetFilter)
@@ -141,10 +146,12 @@ class ServiceContainer:
             raise ValueError("TRPC_SERVICE_RUNTIME_BACKEND must be 'memory' or 'postgres'")
         self.runtime = PlatformRuntime(self.store, self.bus)
         self.agent_factory = AgentFactory(self.settings, secrets=self.secrets)
+        self.aibot_registry = AIBotRegistry()
         self.adapters = {
             "mock": self.mock_channel,
             "telegram": TelegramAdapter(self.secrets),
             "wecom": WeComAdapter(self.secrets),
+            "wecom_aibot": WeComAIBotAdapter(self.aibot_registry),
         }
 
     def create_tenant(self, body: TenantCreate) -> dict[str, Any]:
@@ -213,13 +220,19 @@ class ServiceContainer:
         return self.control.serialize(self.control.rollback_agent(tenant_id, agent_id))
 
     def create_binding(self, tenant_id: str, body: ChannelCreate) -> dict[str, Any]:
+        if body.provider != "wecom_aibot" and not body.webhook_key:
+            raise ValueError("webhook_key is required for callback-based channels")
+        # Long connections authenticate to WeCom instead of a public callback.
+        # The relational locator still requires a non-null unique hash, so make
+        # an unguessable internal value that is never exposed or used as a URL.
+        webhook_key = body.webhook_key or token_urlsafe(32)
         binding = self.control.create_binding(
             tenant_id,
             binding_id=body.binding_id,
             agent_id=body.agent_id,
             provider=body.provider,
             external_account_id=body.external_account_id,
-            webhook_key=body.webhook_key,
+            webhook_key=webhook_key,
             secret_ref=body.secret_ref,
             capabilities=body.capabilities,
         )
@@ -248,8 +261,20 @@ class ServiceContainer:
     ) -> dict[str, Any]:
         binding = self.control.resolve_callback_binding(provider, binding_key)
         adapter = self.adapters[provider]
-        envelope = await adapter.validate_and_normalize(self.adapter_binding(binding), request)
-        context = _context(binding.tenant_id, request_id, trace_id, actor=f"callback:{provider}")
+        adapter_binding = self.adapter_binding(binding)
+        envelope = await adapter.validate_and_normalize(adapter_binding, request)
+        return self.accept_channel_envelope(adapter_binding, envelope, request_id, trace_id)
+
+    def accept_channel_envelope(
+        self,
+        binding: ChannelBinding,
+        envelope: Any,
+        request_id: str,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        """Persist a provider-verified normalized message in the durable Inbox."""
+
+        context = _context(binding.tenant_id, request_id, trace_id, actor=f"callback:{binding.provider}")
         accepted = self.runtime.accept_inbound(
             context,
             InboundEnvelope(
@@ -270,6 +295,7 @@ class ServiceContainer:
                     "principal": envelope.principal.external_user_id,
                     "recipient_id": envelope.principal.external_user_id,
                     "external_message_id": envelope.external_message_id,
+                    "channel_context": dict(envelope.transport_context),
                 },
                 request_id=request_id,
                 trace_id=trace_id,
@@ -281,6 +307,33 @@ class ServiceContainer:
             "request_id": request_id,
             "trace_id": trace_id,
         }
+
+    async def accept_aibot_frame(self, binding: ChannelBinding, request: CallbackRequest) -> None:
+        """Accept a verified WebSocket frame without exposing an HTTP callback route."""
+
+        adapter = self.adapters["wecom_aibot"]
+        envelope = await adapter.validate_and_normalize(binding, request)
+        trace_id = envelope.traceparent.split("-")[1] if "-" in envelope.traceparent else ""
+        self.accept_channel_envelope(
+            binding,
+            envelope,
+            request_id=f"aibot-{envelope.event_id}",
+            trace_id=trace_id,
+        )
+
+    def aibot_bindings(self) -> list[ChannelBinding]:
+        return [
+            self.adapter_binding(binding)
+            for binding in self.control.bindings_for_provider("wecom_aibot")
+        ]
+
+    def aibot_supervisor(self) -> WeComAIBotSupervisor:
+        return WeComAIBotSupervisor(
+            bindings=self.aibot_bindings,
+            secrets_provider=self.secrets,
+            registry=self.aibot_registry,
+            on_inbound=self.accept_aibot_frame,
+        )
 
     async def execute_inbox(
         self, context: TenantContext, inbox_id: str, worker_id: str
@@ -352,6 +405,7 @@ class ServiceContainer:
                         or inbox.get("subject_id")
                         or ""
                     ),
+                    metadata=dict(inbox["payload"].get("channel_context") or {}),
                 ),
                 actual_budget_units={
                     "model_tokens": result.usage["input_tokens"] + result.usage["output_tokens"]
@@ -469,7 +523,9 @@ class ServiceContainer:
 
         return await self.deliver_replies(tenant_id, request_id, trace_id)
 
-    async def _deliver_outbox(self, record: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    async def _deliver_outbox(
+        self, record: Mapping[str, Any], *, provider_filter: str | None = None
+    ) -> tuple[dict[str, Any], bool]:
         """Attempt one published reply and state whether its Stream entry is final.
 
         Failed known requests remain unacknowledged in Redis so they are reclaimed
@@ -490,6 +546,13 @@ class ServiceContainer:
             )
             return {"outbox_id": outbox_id, "status": "api_reply"}, True
         binding = self.control.binding(tenant_id, binding_id)
+        # Smart Bot replies must be emitted by the singleton gateway that owns
+        # the WebSocket.  General dispatcher replicas acknowledge their own
+        # consumer-group copy without ever attempting a second connection.
+        if provider_filter is not None and binding.provider != provider_filter:
+            return {"outbox_id": outbox_id, "status": "provider_skipped"}, True
+        if provider_filter is None and binding.provider == "wecom_aibot":
+            return {"outbox_id": outbox_id, "status": "aibot_gateway_required"}, True
         adapter = self.adapters.get(binding.provider)
         if adapter is None:
             raise ChannelError("unsupported_provider", f"no adapter for {binding.provider}")
@@ -508,11 +571,13 @@ class ServiceContainer:
                 if isinstance(block, Mapping)
             ),
             traceparent=f"00-{str(record.get('trace_id') or '0' * 32)[:32]}-{'0' * 16}-01",
+            metadata=dict(payload.get("metadata") or {}),
         )
         capability_by_provider = {
             "mock": "idempotent",
             "telegram": "non_retriable",
             "wecom": "queryable",
+            "wecom_aibot": "non_retriable",
         }
         capability = capability_by_provider.get(binding.provider, "queryable")
         attempt = self.delivery_ledger.begin(
@@ -561,7 +626,12 @@ class ServiceContainer:
         return _json(final), final.status != "failed"
 
     async def deliver_replies(
-        self, tenant_id: str, request_id: str = "", trace_id: str = ""
+        self,
+        tenant_id: str,
+        request_id: str = "",
+        trace_id: str = "",
+        *,
+        provider_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         """Deliver currently published replies for one tenant (memory/demo path)."""
 
@@ -571,12 +641,17 @@ class ServiceContainer:
         for outbox in snapshot["outbox"]:
             if outbox["event_type"] != "reply.dispatch" or outbox["status"] != "published":
                 continue
-            outcome, _ = await self._deliver_outbox(outbox)
+            outcome, _ = await self._deliver_outbox(outbox, provider_filter=provider_filter)
             outcomes.append(outcome)
         return outcomes
 
     async def process_delivery_published(
-        self, request_id: str = "", trace_id: str = ""
+        self,
+        request_id: str = "",
+        trace_id: str = "",
+        *,
+        provider_filter: str | None = None,
+        consumer_group: str | None = None,
     ) -> list[dict[str, Any]]:
         """Consume reply events in a separate Redis group from model workers."""
 
@@ -584,9 +659,11 @@ class ServiceContainer:
             return [
                 outcome
                 for tenant_id in self.control.tenant_ids()
-                for outcome in await self.deliver_replies(tenant_id, request_id, trace_id)
+                for outcome in await self.deliver_replies(
+                    tenant_id, request_id, trace_id, provider_filter=provider_filter
+                )
             ]
-        group = "trpc-agent-delivery"
+        group = consumer_group or "trpc-agent-delivery"
         consumer = self.settings.dispatcher_id
         messages = self.bus.reclaim_idle(group, consumer, min_idle_ms=60_000)
         messages.extend(self.bus.consume(group, consumer, block_ms=250))
@@ -596,7 +673,7 @@ class ServiceContainer:
                 self.bus.acknowledge(group, message_id)
                 continue
             try:
-                outcome, final = await self._deliver_outbox(record)
+                outcome, final = await self._deliver_outbox(record, provider_filter=provider_filter)
                 outcomes.append(outcome)
                 if final:
                     self.bus.acknowledge(group, message_id)

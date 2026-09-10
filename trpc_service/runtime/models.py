@@ -369,6 +369,7 @@ class ReplyDraft:
     channel_binding_id: str | None = None
     recipient_id: str | None = None
     delivery_key: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

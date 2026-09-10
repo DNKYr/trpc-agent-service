@@ -1058,6 +1058,7 @@ class PostgresRuntimeTransaction:
                     "recipient_id": commit.reply.recipient_id or inbox.subject_id,
                     "blocks": [dict(block) for block in commit.reply.blocks],
                     "delivery_key": delivery_key,
+                    "metadata": dict(commit.reply.metadata),
                 },
                 idempotency_key=f"reply:{delivery_key}",
                 trace_id=inbox.trace_id,

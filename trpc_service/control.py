@@ -231,6 +231,16 @@ class ControlPlane:
             except KeyError as exc:
                 raise ControlNotFound(f"binding {binding_id!r} does not exist") from exc
 
+    def bindings_for_provider(self, provider: str) -> list[Binding]:
+        """Scheduler-only active bindings for an outbound connection transport."""
+
+        with self._lock:
+            return [
+                binding
+                for binding in self._bindings.values()
+                if binding.provider == provider and binding.status == "active"
+            ]
+
     def resolve_callback_binding(self, provider: str, webhook_key: str) -> Binding:
         """Protected exact-match locator: only public callback paths call this."""
 

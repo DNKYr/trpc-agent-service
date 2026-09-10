@@ -112,6 +112,10 @@ class InboundEnvelope:
     session_id: str
     traceparent: str
     raw_type: str = "text"
+    # Correlation data created only by a verified provider transport.  Durable
+    # reply delivery needs it for protocols, such as WeCom Smart Bot, whose
+    # response must reuse the original connection request ID.
+    transport_context: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def payload_hash(self) -> str:

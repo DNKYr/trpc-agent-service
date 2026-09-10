@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ApiModel(BaseModel):
@@ -53,11 +53,17 @@ class ReleaseCreate(ApiModel):
 class ChannelCreate(ApiModel):
     binding_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$")
     agent_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
-    provider: Literal["mock", "telegram", "wecom"]
+    provider: Literal["mock", "telegram", "wecom", "wecom_aibot"]
     external_account_id: str = Field(min_length=1, max_length=256)
-    webhook_key: str = Field(min_length=16, max_length=512)
+    webhook_key: str | None = Field(default=None, min_length=16, max_length=512)
     secret_ref: str = Field(default="env://mock-channel-secret", min_length=1, max_length=512)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_transport_requirements(self) -> ChannelCreate:
+        if self.provider != "wecom_aibot" and not self.webhook_key:
+            raise ValueError("webhook_key is required for callback-based channels")
+        return self
 
 
 class BudgetCreate(ApiModel):

@@ -103,6 +103,25 @@ services:
       redis: {condition: service_healthy}
       migrate: {condition: service_completed_successfully}
 
+  wecom-aibot:
+    build: .
+    # This singleton owns each Bot ID's one permitted outbound WebSocket and
+    # consumes Smart Bot replies in its own Redis consumer group.
+    command: python -m trpc_service._cli wecom-aibot --no-once
+    # The file is deliberately not committed.  When present it should contain
+    # only TRPC_LIVE_WECOM_AIBOT_SECRET and be mode 0600.
+    env_file:
+      - path: .wecom-aibot.env
+        required: false
+    environment:
+      TRPC_SERVICE_RUNTIME_BACKEND: postgres
+      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
+      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+
 volumes:
   postgres-data:
   redis-data:

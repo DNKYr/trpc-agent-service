@@ -17,15 +17,24 @@ from .adapters import (
     WeComAdapter,
     deterministic_session_id,
 )
+from .wecom_aibot import (
+    DEFAULT_WS_URL,
+    AIBotRegistry,
+    WeComAIBotAdapter,
+    WeComAIBotConnection,
+    WeComAIBotSupervisor,
+)
 
 __all__ = [
     "Attachment",
+    "AIBotRegistry",
     "CallbackRequest",
     "ChannelAdapter",
     "ChannelBinding",
     "ChannelError",
     "DeliveryCapability",
     "DeliveryResult",
+    "DEFAULT_WS_URL",
     "InboundEnvelope",
     "MockChannelAdapter",
     "Principal",
@@ -33,5 +42,8 @@ __all__ = [
     "ReplyEnvelope",
     "TelegramAdapter",
     "WeComAdapter",
+    "WeComAIBotAdapter",
+    "WeComAIBotConnection",
+    "WeComAIBotSupervisor",
     "deterministic_session_id",
 ]

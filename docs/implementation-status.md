@@ -48,4 +48,7 @@ operator-provided environment or explicitly enabled sandbox credentials.
 - [x] Local backup/restore drill passed against an isolated PostgreSQL database; a 200-request loopback health probe completed with 200 successes.
 - [x] Fresh full Compose execution passed image build, migration, API/worker/dispatcher startup, and the opt-in callback-to-`delivered` deployment probe.
 - [ ] Full Compose integration execution remains pending on the VPS test environment.
-- [ ] Live WeCom/Telegram delivery probes remain pending explicit sandbox credentials and `RUN_LIVE_CHANNEL_TESTS=1`.
+- [x] WeCom Smart Bot long-connection gateway: authenticated outbound WebSocket,
+  heartbeat/reconnect handling, one-connection topology, durable Inbox/Outbox
+  integration, and ack-aware final stream replies.
+- [ ] Live WeCom/Telegram delivery probes remain pending explicit sandbox credentials and `RUN_LIVE_CHANNEL_TESTS=1` (Smart Bot live verification is performed by sending it one message after binding).

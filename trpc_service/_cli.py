@@ -247,6 +247,31 @@ def command_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_wecom_aibot_gateway(args: argparse.Namespace) -> int:
+    """Own Smart Bot WebSockets and their separate durable reply consumer group."""
+
+    services = ServiceContainer(AppSettings.from_env())
+    supervisor = services.aibot_supervisor()
+    await supervisor.start()
+    try:
+        while True:
+            published = services.dispatch_all()
+            delivered = await services.process_delivery_published(
+                provider_filter="wecom_aibot", consumer_group="trpc-agent-wecom-aibot"
+            )
+            _dump({"published": published, "delivered": delivered})
+            if args.once:
+                break
+            await asyncio.sleep(1)
+    finally:
+        await supervisor.close()
+    return 0
+
+
+def command_wecom_aibot(args: argparse.Namespace) -> int:
+    return asyncio.run(_run_wecom_aibot_gateway(args))
+
+
 def command_migrate(_: argparse.Namespace) -> int:
     """Apply the executable Alembic revision (requires a PostgreSQL DATABASE_URL)."""
 
@@ -265,13 +290,14 @@ def build_parser() -> argparse.ArgumentParser:
         ("api", command_api),
         ("worker", command_worker),
         ("dispatcher", command_dispatcher),
+        ("wecom-aibot", command_wecom_aibot),
         ("migrate", command_migrate),
         ("seed", command_seed),
         ("demo", command_demo),
     ):
         command = sub.add_parser(name)
         command.set_defaults(handler=handler)
-        if name in {"worker", "dispatcher"}:
+        if name in {"worker", "dispatcher", "wecom-aibot"}:
             command.add_argument("--once", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
