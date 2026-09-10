@@ -259,7 +259,8 @@ async def _run_wecom_aibot_gateway(args: argparse.Namespace) -> int:
             delivered = await services.process_delivery_published(
                 provider_filter="wecom_aibot", consumer_group="trpc-agent-wecom-aibot"
             )
-            _dump({"published": published, "delivered": delivered})
+            if delivered or any(events for events in published.values()):
+                _dump({"published": published, "delivered": delivered})
             if args.once:
                 break
             await asyncio.sleep(1)
