@@ -23,9 +23,14 @@ class TenantResponse(ApiModel):
     tenant_id: str
     display_name: str
     status: str
+    audit_policy: dict[str, Any] = Field(default_factory=dict)
+    budget_policy: dict[str, Any] = Field(default_factory=dict)
     routing_epoch: int
     security_epoch: int
     execution_mode: str
+    tool_denylist: list[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
 
 
 class AgentCreate(ApiModel):

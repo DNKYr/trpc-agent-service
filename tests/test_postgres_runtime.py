@@ -32,7 +32,11 @@ def _settings() -> tuple[str, str]:
     redis_url = os.environ.get("TRPC_TEST_REDIS_URL")
     if not database_url or not redis_url:
         pytest.skip("set TRPC_TEST_DATABASE_URL and TRPC_TEST_REDIS_URL to run integration tests")
-    pytest.importorskip("psycopg")
+    # A source-only psycopg install without libpq raises ImportError during
+    # module initialisation.  Treat that exactly like an absent optional
+    # integration dependency; the test will still run in the production image
+    # and explicitly configured integration environments.
+    pytest.importorskip("psycopg", exc_type=ImportError)
     redis = pytest.importorskip("redis")
     try:
         redis.Redis.from_url(redis_url).ping()
@@ -135,7 +139,7 @@ def test_postgres_inbox_outbox_redis_and_delivery_transition_are_shared():
 
 def test_postgres_rls_cannot_read_another_tenant():
     database_url, _ = _settings()
-    psycopg = pytest.importorskip("psycopg")
+    psycopg = pytest.importorskip("psycopg", exc_type=ImportError)
     first_tenant, second_tenant = f"rls_{uuid4().hex}", f"rls_{uuid4().hex}"
     control = PostgresControlPlane(database_url)
     _seed(control, first_tenant)
