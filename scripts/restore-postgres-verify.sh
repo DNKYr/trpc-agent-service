@@ -25,8 +25,13 @@ existing_tables="$(psql "$TRPC_RESTORE_TARGET_URL" -Atqc "
 }
 
 pg_restore --no-owner --no-privileges --dbname "$TRPC_RESTORE_TARGET_URL" "$backup_file"
-psql "$TRPC_RESTORE_TARGET_URL" -v ON_ERROR_STOP=1 -Atqc "
-  SELECT count(*) FROM public.tenant_runtime_state;
-  SELECT count(*) FROM public.alembic_version;
-" >/dev/null
+runtime_schema_restored="$(psql "$TRPC_RESTORE_TARGET_URL" -v ON_ERROR_STOP=1 -Atqc "
+  SELECT to_regclass('public.tenant') IS NOT NULL
+     AND to_regclass('public.tenant_runtime_state') IS NOT NULL
+     AND to_regclass('public.outbox') IS NOT NULL;
+")"
+[[ "$runtime_schema_restored" == "t" ]] || {
+  echo "restore did not contain the required runtime schema" >&2
+  exit 1
+}
 echo "restore verification succeeded"
