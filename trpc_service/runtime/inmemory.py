@@ -284,6 +284,11 @@ class InMemoryRuntimeTransaction:
         if outbox.status not in {OutboxStatus.PUBLISHED, OutboxStatus.DELIVERED}:
             raise InvalidTransition("reply delivery must follow Outbox publication")
         outbox.status = OutboxStatus.DELIVERED
+        if outbox.event_type == "reply.dispatch" and outbox.inbox_id:
+            inbox = self._store._data.inboxes.get((self._tenant(), outbox.inbox_id))
+            if inbox is not None and inbox.status == InboxStatus.REPLY_PENDING:
+                inbox.status = InboxStatus.DELIVERED
+                inbox.updated_at = self._now()
 
     def release_outbox(self, outbox_id: str, owner: str, delay_seconds: int = 0) -> None:
         outbox = self._require_outbox(outbox_id)
@@ -677,6 +682,7 @@ class InMemoryRuntimeTransaction:
                     "inbox_id": inbox.inbox_id,
                     "channel_binding_id": commit.reply.channel_binding_id
                     or inbox.channel_binding_id,
+                    "recipient_id": commit.reply.recipient_id or inbox.subject_id,
                     "blocks": [deepcopy(dict(block)) for block in commit.reply.blocks],
                     "delivery_key": delivery_key,
                 },

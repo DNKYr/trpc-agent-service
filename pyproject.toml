@@ -50,6 +50,11 @@ include = ["trpc_service*"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+markers = [
+  "integration: requires an explicitly configured PostgreSQL and Redis test stack",
+  "live: sends a probe through explicitly enabled sandbox channel credentials",
+  "load: exercises an explicitly configured deployed HTTP endpoint",
+]
 
 [tool.ruff]
 line-length = 100

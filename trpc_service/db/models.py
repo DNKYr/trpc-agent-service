@@ -52,6 +52,18 @@ class Tenant(Base):
     )
 
 
+class TenantLocator(Base):
+    """Scheduler-only tenant index; it is intentionally not an RLS business table."""
+
+    __tablename__ = "tenant_locator"
+
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenant.tenant_id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
 class TenantRuntimeState(Base):
     __tablename__ = "tenant_runtime_state"
 
@@ -97,6 +109,40 @@ class StorageRoute(Base):
             unique=True,
             postgresql_where=text("route_status = 'active'"),
             sqlite_where=text("route_status = 'active'"),
+        ),
+    )
+
+
+class StorageMigration(Base):
+    __tablename__ = "storage_migration"
+
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenant.tenant_id"), primary_key=True)
+    migration_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_profile: Mapped[dict[str, Any]] = mapped_column(JsonValue, nullable=False)
+    target_profile: Mapped[dict[str, Any]] = mapped_column(JsonValue, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_routing_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_routing_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    source_watermark: Mapped[str | None] = mapped_column(Text)
+    target_watermark: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('preparing', 'backfilling', 'catching_up', 'draining', "
+            "'verifying', 'active', 'readonly', 'retired', 'failed')",
+            name="storage_migration_status_ck",
+        ),
+        Index(
+            "storage_migration_active_idx",
+            "tenant_id",
+            "updated_at",
+            postgresql_where=text(
+                "status IN ('preparing', 'backfilling', 'catching_up', 'draining', "
+                "'verifying', 'readonly')"
+            ),
         ),
     )
 
@@ -687,8 +733,10 @@ class AuditLog(Base):
 
 ALL_MODELS = (
     Tenant,
+    TenantLocator,
     TenantRuntimeState,
     StorageRoute,
+    StorageMigration,
     AgentApp,
     AgentRelease,
     ChannelBinding,

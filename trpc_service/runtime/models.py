@@ -367,6 +367,7 @@ class MemoryIntent:
 class ReplyDraft:
     blocks: Sequence[Mapping[str, Any]]
     channel_binding_id: str | None = None
+    recipient_id: str | None = None
     delivery_key: str | None = None
 
 

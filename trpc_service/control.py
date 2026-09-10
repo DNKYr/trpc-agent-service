@@ -137,6 +137,12 @@ class ControlPlane:
             except KeyError as exc:
                 raise ControlNotFound(f"tenant {tenant_id!r} does not exist") from exc
 
+    def tenant_ids(self) -> list[str]:
+        """Return control-plane tenants for local dispatcher scheduling only."""
+
+        with self._lock:
+            return sorted(self._tenants)
+
     def create_agent(self, tenant_id: str, agent_id: str, name: str) -> Agent:
         with self._lock:
             self.tenant(tenant_id)

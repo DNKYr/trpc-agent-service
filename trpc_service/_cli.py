@@ -219,9 +219,15 @@ def command_dispatcher(args: argparse.Namespace) -> int:
     # In a multi-process deployment this command uses the shared SQL/Redis adapters.
     # Memory mode is still useful as a deterministic one-shot health check.
     services = ServiceContainer(AppSettings.from_env())
-    _seed(services)
+    if services.settings.runtime_backend == "memory":
+        _seed(services)
     while True:
-        _dump({"published": services.dispatch("demo-acme")})
+        _dump(
+            {
+                "published": services.dispatch_all(),
+                "delivered": asyncio.run(services.process_delivery_published()),
+            }
+        )
         if args.once:
             break
         time.sleep(1)
@@ -230,9 +236,11 @@ def command_dispatcher(args: argparse.Namespace) -> int:
 
 def command_worker(args: argparse.Namespace) -> int:
     services = ServiceContainer(AppSettings.from_env())
-    _seed(services)
+    if services.settings.runtime_backend == "memory":
+        _seed(services)
     while True:
-        _dump({"processed": asyncio.run(services.process_published("demo-acme"))})
+        tenant_id = "demo-acme" if services.settings.runtime_backend == "memory" else None
+        _dump({"processed": asyncio.run(services.process_published(tenant_id))})
         if args.once:
             break
         time.sleep(1)

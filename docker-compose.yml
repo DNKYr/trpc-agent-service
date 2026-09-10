@@ -5,7 +5,9 @@ services:
       POSTGRES_DB: trpc_agent
       POSTGRES_USER: trpc
       POSTGRES_PASSWORD: trpc
-    ports: ["5432:5432"]
+    # Keep stateful services off the public interface.  Use the Docker network
+    # from application containers; operators can tunnel localhost for recovery.
+    ports: ["127.0.0.1:5432:5432"]
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -16,7 +18,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -32,7 +34,7 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes:
       - minio-data:/data
     healthcheck:
@@ -44,7 +46,7 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.114.0
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
-    ports: ["4317:4317", "4318:4318"]
+    ports: ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
     volumes:
       - ./deploy/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
 

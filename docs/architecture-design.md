@@ -1,6 +1,6 @@
 # tRPC-Agent 多租户节点化部署平台：架构设计
 
-> 状态：Draft v1.1（crash-consistency review）
+> 状态：v1.2（implementation-backed; live-environment validation pending）
 > 目标读者：平台研发、SRE、安全、Agent 应用开发者
 > 范围：控制面、数据面、IM 接入、状态与一致性、治理、可观测性及运维；不包含具体模型提示词设计。
 

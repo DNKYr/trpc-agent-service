@@ -10,6 +10,7 @@ from trpc_service.runtime import (
     BudgetExceeded,
     CommitInput,
     ExecutionMode,
+    ExecutionUnavailable,
     InboundEnvelope,
     InMemoryMessageBus,
     InMemoryRuntimeStore,
@@ -126,6 +127,30 @@ def test_dispatch_is_recoverable_and_never_required_for_acceptance():
     assert len(runtime.dispatch_once(context, "dispatcher")) == 1
     assert len(bus.published) == 1
     assert bus.published[0][1].inbox_id == accepted.inbox.inbox_id
+
+
+def test_dispatcher_crash_after_publish_replays_only_transport_event():
+    """A crash after broker acceptance creates a duplicate, never a new Inbox."""
+
+    clock, runtime, context, bus = make_runtime()
+    accepted = runtime.accept_inbound(context, envelope("provider:crash-gap"))
+    with runtime.store.transaction(context) as tx:
+        leased = tx.claim_outbox("dispatcher-a", limit=1, lease_seconds=5)
+    assert [event.outbox_id for event in leased] == [accepted.outbox.outbox_id]
+    bus.publish(leased[0], leased[0].aggregate_id)  # process dies before SQL publication mark
+
+    clock.advance(6)
+    replayed = runtime.dispatch_once(context, "dispatcher-b", lease_seconds=5)
+    assert [event.outbox_id for _, event in bus.published] == [accepted.outbox.outbox_id] * 2
+    assert [event.outbox_id for event in replayed] == [accepted.outbox.outbox_id]
+    assert len(runtime.snapshot(context)["inboxes"]) == 1
+
+    first_worker = runtime.claim_execution(context, accepted.inbox.inbox_id, "worker-a")
+    with pytest.raises(ExecutionUnavailable):
+        runtime.claim_execution(context, accepted.inbox.inbox_id, "worker-b")
+    runtime.commit_execution(
+        context, first_worker, CommitInput(expected_session_version=0, new_state={"ok": True})
+    )
 
 
 def test_only_one_worker_can_own_fence_and_stale_commit_fails():

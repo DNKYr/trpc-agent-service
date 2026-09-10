@@ -133,6 +133,8 @@ SET resolved_tenant_id = EXCLUDED.resolved_tenant_id,
 
 ALTER TABLE channel_binding_locator OWNER TO platform_schema_owner;
 REVOKE ALL ON channel_binding_locator FROM PUBLIC;
+ALTER TABLE tenant_locator OWNER TO platform_schema_owner;
+REVOKE ALL ON tenant_locator FROM PUBLIC;
 ALTER FUNCTION app_security.resolve_binding(text, text) OWNER TO platform_schema_owner;
 ALTER FUNCTION app_security.sync_binding_locator() OWNER TO platform_schema_owner;
 REVOKE ALL ON FUNCTION app_security.resolve_binding(text, text) FROM PUBLIC;
@@ -152,6 +154,7 @@ BEGIN
         'tenant',
         'tenant_runtime_state',
         'storage_route',
+        'storage_migration',
         'agent_app',
         'agent_release',
         'channel_binding',
@@ -194,7 +197,7 @@ GRANT SELECT ON tenant, tenant_runtime_state, agent_app, agent_release,
 GRANT SELECT, INSERT, UPDATE ON inbox, outbox TO agent_gateway;
 
 -- Worker: all Session-side operations remain tenant scoped; no tenant/config mutation.
-GRANT SELECT ON tenant, tenant_runtime_state, storage_route, agent_app, agent_release,
+GRANT SELECT ON tenant, tenant_runtime_state, storage_route, storage_migration, agent_app, agent_release,
     channel_binding, identity_mapping, knowledge_document TO agent_worker;
 GRANT SELECT, INSERT, UPDATE ON session, session_summary, memory,
     memory_projection, artifact, inbox, outbox, execution_attempt, budget_account,
@@ -203,20 +206,24 @@ GRANT SELECT, INSERT ON session_event TO agent_worker;
 GRANT INSERT ON audit_log TO agent_worker;
 
 -- Dispatcher/Reconciler: publish Outbox and update projections/delivery attempts.
-GRANT SELECT ON tenant, tenant_runtime_state, storage_route, channel_binding,
+GRANT SELECT ON tenant_locator TO agent_dispatcher;
+GRANT SELECT ON tenant, tenant_runtime_state, storage_route, storage_migration, channel_binding,
     session, inbox, memory TO agent_dispatcher;
 GRANT SELECT, INSERT, UPDATE ON outbox, memory_projection, delivery_attempt,
     execution_attempt TO agent_dispatcher;
 GRANT INSERT ON audit_log TO agent_dispatcher;
 
 -- Admin is still tenant scoped. Cross-tenant jobs iterate one SET LOCAL scope at a time.
+GRANT INSERT, UPDATE ON tenant_locator TO agent_admin;
 GRANT SELECT, INSERT, UPDATE ON tenant, tenant_runtime_state,
     agent_app, channel_binding, identity_mapping, budget_account
     TO agent_admin;
-GRANT SELECT, INSERT ON agent_release, storage_route TO agent_admin;
+GRANT SELECT, INSERT ON agent_release, storage_route, storage_migration TO agent_admin;
 GRANT UPDATE (release_status) ON agent_release TO agent_admin;
 GRANT UPDATE (route_status, source_watermark, target_watermark, activated_at)
     ON storage_route TO agent_admin;
+GRANT UPDATE (status, target_routing_epoch, source_watermark, target_watermark, error, updated_at)
+    ON storage_migration TO agent_admin;
 GRANT SELECT, INSERT ON audit_log TO agent_admin;
 
 GRANT SELECT ON audit_log TO agent_auditor;

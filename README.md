@@ -33,6 +33,13 @@ python -m trpc_service._cli migrate
 docker compose up --build api worker dispatcher
 ```
 
+The API, worker, and dispatcher use one shared PostgreSQL fact store and Redis
+Streams consumer groups in this profile. Deployment templates are available in
+[`deploy/kubernetes`](deploy/kubernetes) and
+[`deploy/helm/trpc-agent-service`](deploy/helm/trpc-agent-service); the
+integration, backup, restore, and load runbook is in
+[`docs/operations.md`](docs/operations.md).
+
 Set all three values below to use a real OpenAI-compatible model.  Otherwise
 the deterministic model is selected automatically; no secret is written to a
 release or log.

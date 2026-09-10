@@ -21,8 +21,14 @@ from trpc_service.channels import (
     TelegramAdapter,
     WeComAdapter,
 )
-from trpc_service.config import AppSettings, MockSecretProvider, get_settings
+from trpc_service.config import (
+    AppSettings,
+    EnvironmentSecretProvider,
+    MockSecretProvider,
+    get_settings,
+)
 from trpc_service.control import Binding, ControlConflict, ControlNotFound, ControlPlane
+from trpc_service.db import PostgresControlPlane
 from trpc_service.governance import (
     BudgetFilter,
     InputDLPFilter,
@@ -41,6 +47,9 @@ from trpc_service.runtime import (
     InMemoryRuntimeStore,
     MemoryIntentDraft,
     PlatformRuntime,
+    PostgresDeliveryLedger,
+    PostgresRuntimeStore,
+    RedisStreamMessageBus,
     ReplyDraft,
     RuntimeErrorBase,
     SessionEventDraft,
@@ -99,14 +108,14 @@ class ServiceContainer:
     """
 
     settings: AppSettings
-    control: ControlPlane = field(default_factory=ControlPlane)
-    store: InMemoryRuntimeStore = field(default_factory=InMemoryRuntimeStore)
-    bus: InMemoryMessageBus = field(default_factory=InMemoryMessageBus)
+    control: Any = field(init=False)
+    store: Any = field(init=False)
+    bus: Any = field(init=False)
     mock_channel: MockChannelAdapter = field(default_factory=MockChannelAdapter)
     processed_bus_events: set[str] = field(default_factory=set)
-    delivery_ledger: InMemoryDeliveryLedger = field(default_factory=InMemoryDeliveryLedger)
+    delivery_ledger: Any = field(init=False)
     runtime: PlatformRuntime = field(init=False)
-    secrets: MockSecretProvider = field(init=False)
+    secrets: Any = field(init=False)
     agent_factory: AgentFactory = field(init=False)
     adapters: dict[str, Any] = field(init=False)
     principal_filter: PrincipalFilter = field(default_factory=PrincipalFilter)
@@ -116,8 +125,21 @@ class ServiceContainer:
     output_dlp_filter: OutputDLPFilter = field(default_factory=OutputDLPFilter)
 
     def __post_init__(self) -> None:
+        if self.settings.runtime_backend == "postgres":
+            self.control = PostgresControlPlane(self.settings.database_url)
+            self.store = PostgresRuntimeStore(self.settings.database_url)
+            self.bus = RedisStreamMessageBus(self.settings.redis_url)
+            self.secrets = EnvironmentSecretProvider()
+            self.delivery_ledger = PostgresDeliveryLedger(self.settings.database_url)
+        elif self.settings.runtime_backend == "memory":
+            self.control = ControlPlane()
+            self.store = InMemoryRuntimeStore()
+            self.bus = InMemoryMessageBus()
+            self.secrets = MockSecretProvider()
+            self.delivery_ledger = InMemoryDeliveryLedger()
+        else:
+            raise ValueError("TRPC_SERVICE_RUNTIME_BACKEND must be 'memory' or 'postgres'")
         self.runtime = PlatformRuntime(self.store, self.bus)
-        self.secrets = MockSecretProvider()
         self.agent_factory = AgentFactory(self.settings, secrets=self.secrets)
         self.adapters = {
             "mock": self.mock_channel,
@@ -325,6 +347,11 @@ class ServiceContainer:
                 reply=ReplyDraft(
                     blocks=[{"type": "text", "text": reply}],
                     channel_binding_id=str(inbox["channel_binding_id"]),
+                    recipient_id=str(
+                        inbox["payload"].get("recipient_id")
+                        or inbox.get("subject_id")
+                        or ""
+                    ),
                 ),
                 actual_budget_units={
                     "model_tokens": result.usage["input_tokens"] + result.usage["output_tokens"]
@@ -381,10 +408,49 @@ class ServiceContainer:
             )
         ]
 
+    def dispatch_all(
+        self, request_id: str = "", trace_id: str = ""
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Lease/publish pending Outbox work independently for every active tenant."""
+
+        return {
+            tenant_id: self.dispatch(tenant_id, request_id, trace_id)
+            for tenant_id in self.control.tenant_ids()
+        }
+
     async def process_published(
-        self, tenant_id: str, request_id: str = "", trace_id: str = ""
+        self, tenant_id: str | None = None, request_id: str = "", trace_id: str = ""
     ) -> list[dict[str, Any]]:
         outputs: list[dict[str, Any]] = []
+        if isinstance(self.bus, RedisStreamMessageBus):
+            group = "trpc-agent-workers"
+            consumer = self.settings.worker_id
+            messages = self.bus.reclaim_idle(group, consumer, min_idle_ms=60_000)
+            messages.extend(self.bus.consume(group, consumer, block_ms=250))
+            for message_id, record in messages:
+                event_type = str(record.get("event_type", ""))
+                record_tenant = str(record.get("tenant_id", ""))
+                try:
+                    if event_type == "inbound.dispatch" and record_tenant:
+                        inbox_id = str(
+                            record.get("inbox_id") or record.get("payload", {}).get("inbox_id", "")
+                        )
+                        if inbox_id:
+                            outputs.append(
+                                await self.execute_inbox(
+                                    _context(record_tenant, request_id, trace_id, actor="worker"),
+                                    inbox_id,
+                                    self.settings.worker_id,
+                                )
+                            )
+                    self.bus.acknowledge(group, message_id)
+                except Exception:
+                    # Leave the Stream entry pending.  Redis will make it
+                    # reclaimable; SQL Inbox/fence state suppresses re-effects.
+                    continue
+            return outputs
+        if tenant_id is None:
+            raise ValueError("memory worker requires an explicit tenant_id")
         context = _context(tenant_id, request_id, trace_id, actor="worker")
         for _, event in list(self.bus.published):
             if event.tenant_id != tenant_id or event.outbox_id in self.processed_bus_events:
@@ -399,7 +465,105 @@ class ServiceContainer:
     async def deliver_mock_replies(
         self, tenant_id: str, request_id: str = "", trace_id: str = ""
     ) -> list[dict[str, Any]]:
-        """Delivery integration used by the demo; provider result remains explicit."""
+        """Compatibility entry point for the local demo's mock delivery."""
+
+        return await self.deliver_replies(tenant_id, request_id, trace_id)
+
+    async def _deliver_outbox(self, record: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Attempt one published reply and state whether its Stream entry is final.
+
+        Failed known requests remain unacknowledged in Redis so they are reclaimed
+        after the consumer-idle lease.  Ambiguous effects are recorded for
+        reconciliation/manual review and acknowledged to prevent an unsafe replay.
+        """
+
+        tenant_id = str(record["tenant_id"])
+        outbox_id = str(record["outbox_id"])
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ValueError("reply outbox payload must be an object")
+        binding_id = str(payload.get("channel_binding_id") or "")
+        if not binding_id or binding_id == "api":
+            self.runtime.mark_outbox_delivered(
+                _context(tenant_id, "api-reply", str(record.get("trace_id") or ""), actor="dispatcher"),
+                outbox_id,
+            )
+            return {"outbox_id": outbox_id, "status": "api_reply"}, True
+        binding = self.control.binding(tenant_id, binding_id)
+        adapter = self.adapters.get(binding.provider)
+        if adapter is None:
+            raise ChannelError("unsupported_provider", f"no adapter for {binding.provider}")
+        recipient_id = str(payload.get("recipient_id") or "")
+        if not recipient_id:
+            raise ChannelError("missing_recipient", "reply outbox has no recipient", retryable=False)
+        reply = ReplyEnvelope(
+            tenant_id=tenant_id,
+            binding_id=binding.binding_id,
+            session_id=str(payload.get("session_id", "")),
+            recipient_id=recipient_id,
+            delivery_id=outbox_id,
+            blocks=tuple(
+                ReplyBlock.text_block(str(block.get("text", "")))
+                for block in payload.get("blocks", [])
+                if isinstance(block, Mapping)
+            ),
+            traceparent=f"00-{str(record.get('trace_id') or '0' * 32)[:32]}-{'0' * 16}-01",
+        )
+        capability_by_provider = {
+            "mock": "idempotent",
+            "telegram": "non_retriable",
+            "wecom": "queryable",
+        }
+        capability = capability_by_provider.get(binding.provider, "queryable")
+        attempt = self.delivery_ledger.begin(
+            tenant_id=tenant_id,
+            outbox_id=outbox_id,
+            session_id=reply.session_id,
+            channel_binding_id=binding.binding_id,
+            capability=capability,
+            request_hash=sha256(reply.plain_text().encode()).hexdigest(),
+            trace_id=str(record.get("trace_id") or ""),
+        )
+        if attempt.status != "sending":
+            if attempt.status == "accepted":
+                self.runtime.mark_outbox_delivered(
+                    _context(tenant_id, "delivery-recovery", attempt.trace_id, actor="dispatcher"), outbox_id
+                )
+            return _json(attempt), True
+        try:
+            result = await adapter.deliver(self.adapter_binding(binding), reply)
+            final = self.delivery_ledger.finish(
+                attempt,
+                status=result.status,  # type: ignore[arg-type]
+                provider_message_id=result.provider_message_id,
+                error_code=result.error_code,
+            )
+        except ChannelError as exc:
+            final = self.delivery_ledger.finish(
+                attempt,
+                status="failed" if exc.retryable else "unknown",
+                error_code=exc.code,
+            )
+        except Exception as exc:
+            final = self.delivery_ledger.finish(
+                attempt,
+                status="unknown",
+                error_code=type(exc).__name__,
+            )
+        if final.status == "accepted":
+            self.runtime.mark_outbox_delivered(
+                _context(tenant_id, "delivery", final.trace_id, actor="dispatcher"), outbox_id
+            )
+            return _json(final), True
+        # A provider reported a definite failure; retry it through the durable
+        # consumer-group pending list.  Unknown/manual states are intentionally
+        # terminal until an operator resolves the ledger entry.
+        return _json(final), final.status != "failed"
+
+    async def deliver_replies(
+        self, tenant_id: str, request_id: str = "", trace_id: str = ""
+    ) -> list[dict[str, Any]]:
+        """Deliver currently published replies for one tenant (memory/demo path)."""
 
         context = _context(tenant_id, request_id, trace_id, actor="dispatcher")
         snapshot = self.runtime.snapshot(context)
@@ -407,44 +571,39 @@ class ServiceContainer:
         for outbox in snapshot["outbox"]:
             if outbox["event_type"] != "reply.dispatch" or outbox["status"] != "published":
                 continue
-            binding_id = outbox["payload"].get("channel_binding_id")
-            if not binding_id or binding_id == "api":
+            outcome, _ = await self._deliver_outbox(outbox)
+            outcomes.append(outcome)
+        return outcomes
+
+    async def process_delivery_published(
+        self, request_id: str = "", trace_id: str = ""
+    ) -> list[dict[str, Any]]:
+        """Consume reply events in a separate Redis group from model workers."""
+
+        if not isinstance(self.bus, RedisStreamMessageBus):
+            return [
+                outcome
+                for tenant_id in self.control.tenant_ids()
+                for outcome in await self.deliver_replies(tenant_id, request_id, trace_id)
+            ]
+        group = "trpc-agent-delivery"
+        consumer = self.settings.dispatcher_id
+        messages = self.bus.reclaim_idle(group, consumer, min_idle_ms=60_000)
+        messages.extend(self.bus.consume(group, consumer, block_ms=250))
+        outcomes: list[dict[str, Any]] = []
+        for message_id, record in messages:
+            if str(record.get("event_type", "")) != "reply.dispatch":
+                self.bus.acknowledge(group, message_id)
                 continue
-            binding = self.control.binding(tenant_id, str(binding_id))
-            if binding.provider != "mock":
+            try:
+                outcome, final = await self._deliver_outbox(record)
+                outcomes.append(outcome)
+                if final:
+                    self.bus.acknowledge(group, message_id)
+            except Exception:
+                # The entry stays pending for a leased retry.  The SQL attempt
+                # ledger is written before any provider call when possible.
                 continue
-            reply = ReplyEnvelope(
-                tenant_id=tenant_id,
-                binding_id=binding.binding_id,
-                session_id=str(outbox["payload"].get("session_id", "")),
-                recipient_id=str(outbox["payload"].get("recipient_id", "mock-user")),
-                delivery_id=outbox["outbox_id"],
-                blocks=tuple(
-                    ReplyBlock.text_block(str(block.get("text", "")))
-                    for block in outbox["payload"].get("blocks", [])
-                ),
-                traceparent=f"00-{trace_id or '0' * 32}-{'0' * 16}-01",
-            )
-            result = await self.mock_channel.deliver(self.adapter_binding(binding), reply)
-            capability = str(result.capability.value)
-            attempt = self.delivery_ledger.begin(
-                tenant_id=tenant_id,
-                outbox_id=str(outbox["outbox_id"]),
-                session_id=reply.session_id,
-                channel_binding_id=binding.binding_id,
-                capability=capability,  # type: ignore[arg-type]
-                request_hash=sha256(reply.plain_text().encode()).hexdigest(),
-                trace_id=trace_id,
-            )
-            final = self.delivery_ledger.finish(
-                attempt,
-                status=result.status,  # type: ignore[arg-type]
-                provider_message_id=result.provider_message_id,
-                error_code=result.error_code,
-            )
-            if final.status == "accepted":
-                self.runtime.mark_outbox_delivered(context, str(outbox["outbox_id"]))
-            outcomes.append(_json(final))
         return outcomes
 
 
@@ -499,7 +658,7 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
 
     @app.get("/health/ready")
     async def ready() -> dict[str, str]:
-        return {"status": "ready", "runtime_backend": "memory"}
+        return {"status": "ready", "runtime_backend": services.settings.runtime_backend}
 
     @app.post(
         "/admin/v1/tenants",

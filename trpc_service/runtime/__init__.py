@@ -1,6 +1,6 @@
 """Durable Inbox/Outbox, fenced worker and storage-migration runtime."""
 
-from .delivery import DeliveryAttempt, InMemoryDeliveryLedger
+from .delivery import DeliveryAttempt, InMemoryDeliveryLedger, PostgresDeliveryLedger
 from .errors import (
     BudgetExceeded,
     BudgetUnavailable,
@@ -52,6 +52,7 @@ from .models import (
     to_primitive,
 )
 from .ports import MessageBus, RuntimeStore, RuntimeTransaction
+from .postgres_store import PostgresRuntimeStore
 from .redis_bus import RedisStreamMessageBus
 from .service import InMemoryMessageBus, PlatformRuntime
 
@@ -77,6 +78,8 @@ __all__ = [
     "InMemoryDeliveryLedger",
     "InMemoryMessageBus",
     "InMemoryRuntimeStore",
+    "PostgresRuntimeStore",
+    "PostgresDeliveryLedger",
     "InvalidTransition",
     "LeaseLost",
     "MemoryIntent",

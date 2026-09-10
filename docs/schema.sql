@@ -12,6 +12,16 @@ CREATE TABLE tenant (
     updated_at         timestamptz NOT NULL DEFAULT now()
 );
 
+-- Minimal scheduler index: it deliberately contains only a tenant identifier
+-- and enable bit, never tenant business data. Dispatchers enumerate this table
+-- before opening one RLS-scoped transaction per tenant.
+CREATE TABLE tenant_locator (
+    tenant_id          text PRIMARY KEY REFERENCES tenant(tenant_id) ON DELETE CASCADE,
+    enabled            boolean NOT NULL DEFAULT true,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE tenant_runtime_state (
     tenant_id          text PRIMARY KEY REFERENCES tenant(tenant_id),
     routing_epoch      bigint NOT NULL DEFAULT 1 CHECK (routing_epoch > 0),
@@ -44,6 +54,32 @@ CREATE TABLE storage_route (
 
 CREATE UNIQUE INDEX storage_route_one_active_idx
     ON storage_route (tenant_id) WHERE route_status = 'active';
+
+-- Durable, operator-visible state machine for a tenant storage move.  The
+-- active writer remains ``storage_route``; this ledger makes interrupted
+-- backfill, drain, verification, and rollback work resumable after restarts.
+CREATE TABLE storage_migration (
+    tenant_id             text NOT NULL REFERENCES tenant(tenant_id),
+    migration_id          text NOT NULL,
+    source_profile        jsonb NOT NULL,
+    target_profile        jsonb NOT NULL,
+    status                text NOT NULL CHECK (status IN (
+                              'preparing', 'backfilling', 'catching_up', 'draining',
+                              'verifying', 'active', 'readonly', 'retired', 'failed'
+                          )),
+    source_routing_epoch  bigint NOT NULL,
+    target_routing_epoch  bigint,
+    source_watermark      text,
+    target_watermark      text,
+    error                 text,
+    created_at            timestamptz NOT NULL DEFAULT now(),
+    updated_at            timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, migration_id)
+);
+
+CREATE INDEX storage_migration_active_idx
+    ON storage_migration (tenant_id, updated_at DESC)
+    WHERE status IN ('preparing', 'backfilling', 'catching_up', 'draining', 'verifying', 'readonly');
 
 ALTER TABLE tenant_runtime_state
     ADD CONSTRAINT tenant_runtime_active_route_fk

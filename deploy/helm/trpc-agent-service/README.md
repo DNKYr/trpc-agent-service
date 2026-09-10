@@ -1,0 +1,18 @@
+# Helm deployment
+
+Create the referenced Kubernetes Secret through External Secrets, Sealed Secrets,
+or your cloud secret manager. It must provide at least
+`TRPC_SERVICE_DATABASE_URL` and `TRPC_SERVICE_REDIS_URL`; model and channel
+credentials are optional for mock mode. Never commit a populated Secret manifest.
+
+```bash
+helm upgrade --install trpc-agent-service . \
+  --namespace trpc-agent --create-namespace \
+  --set image.repository=registry.example/trpc-agent-service \
+  --set image.tag=<immutable-image-digest-or-tag>
+```
+
+The migration Job runs as a Helm post-install/post-upgrade hook. Set
+`migration.hook=false` only when migrations are operated by a separate approved
+pipeline. HPA requires metrics-server; use KEDA with Redis Stream lag for
+queue-aware worker scaling in clusters that provide it.

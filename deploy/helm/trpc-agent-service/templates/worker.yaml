@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "trpc-agent-service.fullname" . }}-worker
+  labels:
+    {{- include "trpc-agent-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "trpc-agent-service.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "trpc-agent-service.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: {{ include "trpc-agent-service.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["python", "-m", "trpc_service._cli", "worker", "--no-once"]
+          envFrom:
+            - configMapRef: {name: {{ include "trpc-agent-service.fullname" . }}}
+            - secretRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}}
+          env:
+            - name: TRPC_SERVICE_WORKER_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}

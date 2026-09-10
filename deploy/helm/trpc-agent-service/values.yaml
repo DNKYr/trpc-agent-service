@@ -1,0 +1,75 @@
+image:
+  repository: ghcr.io/example/trpc-agent-service
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+
+secrets:
+  # Supply this Secret out-of-band (External Secrets, Sealed Secrets, or your
+  # cloud secret manager). Expected keys are documented in README.md.
+  existingSecret: trpc-agent-service-secrets
+  externalSecret:
+    enabled: false
+    secretStoreRef: platform-secrets
+    targetName: trpc-agent-service-secrets
+    remoteKeys:
+      databaseUrl: prod/trpc-agent/database-url
+      redisUrl: prod/trpc-agent/redis-url
+      agentApiKey: prod/trpc-agent/model-api-key
+
+config:
+  runtimeBackend: postgres
+  workerId: worker
+  dispatcherId: dispatcher
+  logLevel: INFO
+  otlpEndpoint: ""
+
+api:
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    cpuUtilization: 70
+
+worker:
+  replicas: 2
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    cpuUtilization: 70
+
+dispatcher:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+migration:
+  enabled: true
+  hook: true
+
+backup:
+  # Enable only after a durable, access-controlled PVC is provisioned. The
+  # job uses pg_dump and retains a checksum beside every custom-format dump.
+  enabled: false
+  schedule: "17 2 * * *"
+  image: postgres:16-alpine
+  existingPvc: ""
+  mountPath: /backup
+
+networkPolicy:
+  enabled: true
