@@ -1,0 +1,107 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: trpc_agent
+      POSTGRES_USER: trpc
+      POSTGRES_PASSWORD: trpc
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trpc -d trpc_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    ports: ["6379:6379"]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports: ["4317:4317", "4318:4318"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+
+  migrate:
+    build: .
+    command: python -m trpc_service._cli migrate
+    environment:
+      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  api:
+    build: .
+    command: python -m trpc_service._cli api
+    environment:
+      TRPC_SERVICE_RUNTIME_BACKEND: postgres
+      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
+      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
+      TRPC_SERVICE_OBJECT_STORE_ENDPOINT: http://minio:9000
+      TRPC_SERVICE_OTEL_ENDPOINT: otel-collector:4317
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build: .
+    command: python -m trpc_service._cli worker --no-once
+    environment:
+      TRPC_SERVICE_RUNTIME_BACKEND: postgres
+      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
+      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+
+  dispatcher:
+    build: .
+    command: python -m trpc_service._cli dispatcher --no-once
+    environment:
+      TRPC_SERVICE_RUNTIME_BACKEND: postgres
+      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
+      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
