@@ -21,6 +21,19 @@ Redis consumer-group delivery, a fenced execution/commit, delivery status, and
 the RLS tenant boundary. The focused unit recovery test also simulates the
 crash window after a broker publish but before the Outbox publication mark.
 
+For a self-contained deployment probe (including the running API, dispatcher,
+worker, PostgreSQL, and Redis), run this from the Compose project directory:
+
+```bash
+COMPOSE_INTEGRATION=1 bash scripts/compose-integration.sh
+```
+
+The opt-in script builds/starts the stack, creates one uniquely named mock
+tenant, then waits for its callback to reach the durable `delivered` state. It
+does not stop the stack or delete deployment data. Set `TRPC_COMPOSE_API_URL`
+for a non-default API address and `TRPC_COMPOSE_ADMIN_API_KEY` if admin auth is
+enabled.
+
 ## Backup and restore drill
 
 Run `bash scripts/backup-postgres.sh` with `TRPC_BACKUP_DATABASE_URL` and an
