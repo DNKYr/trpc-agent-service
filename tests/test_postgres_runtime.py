@@ -65,7 +65,9 @@ def _seed(control: PostgresControlPlane, tenant_id: str) -> None:
         binding_id="binding",
         agent_id="agent",
         provider="mock",
-        external_account_id="integration",
+        # The schema protects a provider account from being bound to multiple
+        # tenants, so every integration fixture needs its own account identity.
+        external_account_id=f"integration-{tenant_id}",
         webhook_key=f"integration-{uuid4().hex}",
         secret_ref="test-secret",
         capabilities={},

@@ -38,6 +38,14 @@ def _is_unique_violation(error: Exception) -> bool:
     return getattr(error, "sqlstate", None) == "23505"
 
 
+def _json(value: Any) -> Any:
+    """Adapt JSON values explicitly for psycopg's PostgreSQL codec."""
+
+    from psycopg.types.json import Jsonb
+
+    return Jsonb(value)
+
+
 class PostgresControlPlane:
     """Durable control state shared by API, worker, and dispatcher processes."""
 
@@ -123,7 +131,14 @@ class PostgresControlPlane:
                     INSERT INTO tenant (tenant_id, display_name, status, audit_policy, budget_policy, created_at, updated_at)
                     VALUES (%s, %s, 'active', %s, %s, %s, %s)
                     """,
-                    (tenant_id, display_name, audit_policy or {}, budget_policy or {}, now, now),
+                    (
+                        tenant_id,
+                        display_name,
+                        _json(audit_policy or {}),
+                        _json(budget_policy or {}),
+                        now,
+                        now,
+                    ),
                 )
                 connection.execute(
                     """
@@ -146,7 +161,7 @@ class PostgresControlPlane:
                     (tenant_id, routing_epoch, profile, route_status, created_at, activated_at)
                     VALUES (%s, 1, %s, 'active', %s, %s)
                     """,
-                    (tenant_id, {"profile": "postgres-default"}, now, now),
+                    (tenant_id, _json({"profile": "postgres-default"}), now, now),
                 )
         except Exception as exc:
             if _is_unique_violation(exc):
@@ -215,10 +230,10 @@ class PostgresControlPlane:
                         tenant_id,
                         agent_id,
                         version,
-                        values.get("app_config") or {},
-                        values.get("model_config") or {},
-                        values.get("tool_policy") or {},
-                        values.get("knowledge_config") or {},
+                        _json(values.get("app_config") or {}),
+                        _json(values.get("model_config") or {}),
+                        _json(values.get("tool_policy") or {}),
+                        _json(values.get("knowledge_config") or {}),
                         values.get("created_by", "admin"),
                         values.get("change_reason", "API release"),
                         now,
@@ -318,7 +333,7 @@ class PostgresControlPlane:
                         values["external_account_id"],
                         digest,
                         values["secret_ref"],
-                        values.get("capabilities") or {},
+                        _json(values.get("capabilities") or {}),
                         now,
                         now,
                     ),

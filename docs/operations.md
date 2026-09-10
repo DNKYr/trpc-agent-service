@@ -36,7 +36,8 @@ bash scripts/restore-postgres-verify.sh backups/trpc-agent-YYYYMMDDTHHMMSSZ.dump
 ```
 
 The verifier checks the checksum, refuses a nonempty target, restores, and
-checks runtime and Alembic tables. It never drops or overwrites a database.
+checks the required tenant, runtime-state, and Outbox tables. It never drops
+or overwrites a database.
 
 ## Load and live-channel probes
 
