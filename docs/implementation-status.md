@@ -44,5 +44,7 @@ operator-provided environment or explicitly enabled sandbox credentials.
 - [x] Focused runtime tests cover atomic Inbox/Outbox, duplicate callbacks, dispatcher crash after broker publish, worker fence loss, concurrent budget reservations, unknown non-retriable Tool state, durable reply/memory Outbox, and routing-epoch migration fencing.
 - [x] `python -m trpc_service._cli demo` is the end-to-end mock evidence command (two tenants, reply, duplicate, isolation, trace IDs, unknown Tool, budget rejection).
 - [x] Opt-in PostgreSQL/RLS + Redis integration tests, backup/restore verifier, and bounded HTTP load probe are included in the repository.
+- [x] Local Docker PostgreSQL/Redis execution passed atomic Inbox/Outbox, callback/service-container, dispatcher, worker, durable delivery, and RLS-boundary integration cases.
+- [x] Local backup/restore drill passed against an isolated PostgreSQL database; a 200-request loopback health probe completed with 200 successes.
 - [ ] Full Compose integration execution remains pending on the VPS test environment.
 - [ ] Live WeCom/Telegram delivery probes remain pending explicit sandbox credentials and `RUN_LIVE_CHANNEL_TESTS=1`.
