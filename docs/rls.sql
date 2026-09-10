@@ -173,7 +173,10 @@ BEGIN
         'budget_reservation',
         'tool_execution',
         'delivery_attempt',
-        'audit_log'
+        'audit_log',
+        -- Partitions do not inherit ENABLE/FORCE RLS from their parent. The
+        -- default audit partition must be protected against direct reads too.
+        'audit_log_default'
     ]
     LOOP
         EXECUTE pg_catalog.format('ALTER TABLE public.%I OWNER TO platform_schema_owner', table_name);

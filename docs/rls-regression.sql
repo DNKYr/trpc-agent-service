@@ -42,6 +42,10 @@ BEGIN
     WHERE cols.table_schema = 'public'
       AND cols.column_name = 'tenant_id'
       AND cls.relkind IN ('r', 'p')
+      -- The scheduler index contains only IDs/enabled bits and deliberately
+      -- has no tenant business rows; it is the sole controlled enumeration
+      -- surface for dispatchers before they enter a tenant-scoped transaction.
+      AND cols.table_name <> 'tenant_locator'
       AND NOT (cls.relrowsecurity AND cls.relforcerowsecurity);
 
     IF unsafe_count <> 0 THEN
