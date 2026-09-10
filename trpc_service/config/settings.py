@@ -200,8 +200,14 @@ def get_settings() -> AppSettings:
 def parse_secret_json(value: str) -> Mapping[str, object]:
     """Parse a structured provider secret while retaining a clear validation error."""
 
+    # Docker's ``--env-file`` preserves shell quotes, while Compose and a shell
+    # strip them.  Supporting both forms keeps structured channel secrets
+    # portable without accidentally treating quoted JSON as a raw credential.
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1].strip()
     try:
-        parsed = json.loads(value)
+        parsed = json.loads(normalized)
     except json.JSONDecodeError as exc:
         raise ValueError("expected JSON secret material") from exc
     if not isinstance(parsed, dict):

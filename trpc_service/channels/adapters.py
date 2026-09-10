@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -247,7 +248,13 @@ def _secret_field(secret: str, field_name: str, *, fallback_to_raw: bool = False
     try:
         parsed = parse_secret_json(secret)
     except ValueError:
-        return secret if fallback_to_raw else None
+        # A malformed JSON-shaped secret must never be treated as a raw token:
+        # it could then be interpolated into a provider URL and leak in a
+        # low-level client exception.  Raw credentials remain supported.
+        candidate = secret.strip()
+        if fallback_to_raw and candidate and candidate[0] not in {"{", "[", "'", '"'}:
+            return candidate
+        return None
     value = parsed.get(field_name)
     return str(value) if value is not None else None
 
@@ -283,6 +290,15 @@ async def _http_json(
             except json.JSONDecodeError:
                 parsed = {}
             return exc.code, parsed if isinstance(parsed, dict) else {}, dict(exc.headers.items())
+        except (http.client.HTTPException, OSError, ValueError) as exc:
+            # Never propagate a stdlib exception: its rendered URL may embed a
+            # provider token in path-based APIs such as Telegram's.
+            raise ChannelError(
+                "provider_transport_error",
+                "provider HTTP transport failed",
+                retryable=True,
+                status_code=503,
+            ) from exc
 
     return await asyncio.to_thread(request)
 
