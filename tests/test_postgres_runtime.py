@@ -7,11 +7,14 @@ Run only against an isolated database that has already been migrated:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from uuid import uuid4
 
 import pytest
 
+from trpc_service.channels import CallbackRequest
+from trpc_service.config import AppSettings
 from trpc_service.db import PostgresControlPlane
 from trpc_service.runtime import (
     BudgetAccount,
@@ -23,6 +26,8 @@ from trpc_service.runtime import (
     ReplyDraft,
     TenantContext,
 )
+from trpc_service.web.app import ServiceContainer
+from trpc_service.web.schemas import AgentCreate, ChannelCreate, ReleaseCreate, TenantCreate
 
 pytestmark = pytest.mark.integration
 
@@ -156,3 +161,63 @@ def test_postgres_rls_cannot_read_another_tenant():
             second_rows = conn.execute("SELECT tenant_id FROM tenant ORDER BY tenant_id").fetchall()
     assert [row[0] for row in first_rows] == [first_tenant]
     assert [row[0] for row in second_rows] == [second_tenant]
+
+
+def test_postgres_service_container_wires_callback_worker_dispatcher_and_delivery():
+    """Exercise the same durable adapters used by the API, worker, and dispatcher CLIs."""
+
+    database_url, redis_url = _settings()
+    tenant_id = f"service_{uuid4().hex}"
+    webhook_key = f"service-{uuid4().hex}"
+    services = ServiceContainer(
+        AppSettings(
+            runtime_backend="postgres",
+            database_url=database_url,
+            redis_url=redis_url,
+            mock_model=True,
+            worker_id=f"worker-{uuid4().hex}",
+            dispatcher_id=f"dispatcher-{uuid4().hex}",
+        )
+    )
+    services.create_tenant(TenantCreate(tenant_id=tenant_id, display_name="Service integration"))
+    services.create_agent(tenant_id, AgentCreate(agent_id="agent", name="Integration agent"))
+    services.create_release(
+        tenant_id,
+        "agent",
+        ReleaseCreate(version=1, model_config={"mode": "mock"}),
+    )
+    services.activate_release(tenant_id, "agent", 1)
+    services.create_binding(
+        tenant_id,
+        ChannelCreate(
+            binding_id="binding",
+            agent_id="agent",
+            provider="mock",
+            external_account_id=f"service-{tenant_id}",
+            webhook_key=webhook_key,
+            capabilities={"callback_secret": "test-secret"},
+        ),
+    )
+
+    async def scenario() -> None:
+        accepted = await services.accept_callback(
+            "mock",
+            webhook_key,
+            CallbackRequest(
+                body={"message_id": "message-1", "user_id": "sandbox-user", "text": "ticket 42"},
+                headers={"x-mock-secret": "test-secret"},
+            ),
+            request_id="service-integration",
+            trace_id="b" * 32,
+        )
+        assert accepted["duplicate"] is False
+        assert tenant_id in services.dispatch_all()
+        processed = await services.process_published()
+        assert any(row["inbox_id"] == accepted["inbox_id"] for row in processed)
+        services.dispatch_all()
+        deliveries = await services.process_delivery_published()
+        assert any(row["status"] == "accepted" for row in deliveries)
+
+    asyncio.run(scenario())
+    snapshot = services.runtime.snapshot(TenantContext(tenant_id))
+    assert snapshot["inboxes"][0]["status"] == "delivered"
