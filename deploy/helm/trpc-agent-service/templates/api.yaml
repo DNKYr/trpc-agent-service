@@ -31,8 +31,24 @@ spec:
           ports: [{name: http, containerPort: 8000}]
           envFrom:
             - configMapRef: {name: {{ include "trpc-agent-service.fullname" . }}}
-            - secretRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}}
           env:
+            - name: TRPC_SERVICE_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.apiDatabaseUrl }}}
+            - name: TRPC_SERVICE_DATABASE_ROLE
+              value: agent_api_gateway
+            - name: TRPC_SERVICE_REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.redisUrl }}}
+            - name: TRPC_SERVICE_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.adminApiKey }}}
+            - name: TRPC_SERVICE_TENANT_API_KEYS
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.tenantApiKeys }}, optional: true}
+            - name: TRPC_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.agentApiKey }}, optional: true}
             - name: TRPC_SERVICE_WORKER_ID
               value: {{ printf "%s-api" (include "trpc-agent-service.fullname" .) | quote }}
           securityContext:

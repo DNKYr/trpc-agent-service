@@ -1,17 +1,22 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    # This private file contains only the bootstrap and per-workload database
+    # passwords.  It is required: the former trpc bootstrap superuser must
+    # never be used by application processes.
+    env_file:
+      - path: .db-bootstrap.env
+        required: true
     environment:
       POSTGRES_DB: trpc_agent
-      POSTGRES_USER: trpc
-      POSTGRES_PASSWORD: trpc
     # Keep stateful services off the public interface.  Use the Docker network
     # from application containers; operators can tunnel localhost for recovery.
     ports: ["127.0.0.1:5432:5432"]
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/init/00-create-workload-roles.sh:/docker-entrypoint-initdb.d/00-create-workload-roles.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trpc -d trpc_agent"]
+      test: ["CMD-SHELL", "pg_isready -U $${TRPC_DB_BOOTSTRAP_USER:-$${POSTGRES_USER:-postgres}} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -53,20 +58,18 @@ services:
   migrate:
     build: .
     command: python -m trpc_service._cli migrate
-    environment:
-      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
+    env_file:
+      - path: .migrator.env
+        required: true
     depends_on:
       postgres: {condition: service_healthy}
 
   api:
     build: .
     command: python -m trpc_service._cli api
-    environment:
-      TRPC_SERVICE_RUNTIME_BACKEND: postgres
-      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
-      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
-      TRPC_SERVICE_OBJECT_STORE_ENDPOINT: http://minio:9000
-      TRPC_SERVICE_OTEL_ENDPOINT: otel-collector:4317
+    env_file:
+      - path: .api.env
+        required: true
     ports: ["8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -74,7 +77,7 @@ services:
       minio: {condition: service_healthy}
       migrate: {condition: service_completed_successfully}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -82,10 +85,9 @@ services:
   worker:
     build: .
     command: python -m trpc_service._cli worker --no-once
-    environment:
-      TRPC_SERVICE_RUNTIME_BACKEND: postgres
-      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
-      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
+    env_file:
+      - path: .worker.env
+        required: true
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -94,10 +96,9 @@ services:
   dispatcher:
     build: .
     command: python -m trpc_service._cli dispatcher --no-once
-    environment:
-      TRPC_SERVICE_RUNTIME_BACKEND: postgres
-      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
-      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
+    env_file:
+      - path: .dispatcher.env
+        required: true
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -111,12 +112,10 @@ services:
     # The file is deliberately not committed.  When present it should contain
     # only TRPC_LIVE_WECOM_AIBOT_SECRET and be mode 0600.
     env_file:
+      - path: .wecom-aibot-runtime.env
+        required: true
       - path: .wecom-aibot.env
         required: false
-    environment:
-      TRPC_SERVICE_RUNTIME_BACKEND: postgres
-      TRPC_SERVICE_DATABASE_URL: postgresql+asyncpg://trpc:trpc@postgres:5432/trpc_agent
-      TRPC_SERVICE_REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}

@@ -299,6 +299,15 @@ class InMemoryRuntimeTransaction:
         outbox.lease_owner = None
         outbox.lease_expires_at = None
 
+    def requeue_outbox(self, outbox_id: str) -> None:
+        outbox = self._require_outbox(outbox_id)
+        if outbox.status == OutboxStatus.DELIVERED:
+            return
+        outbox.status = OutboxStatus.PENDING
+        outbox.available_at = self._now()
+        outbox.lease_owner = None
+        outbox.lease_expires_at = None
+
     def put_budget_account(self, account: BudgetAccount) -> BudgetAccount:
         if account.tenant_id != self._tenant():
             raise TenantMismatch("budget account belongs to another tenant")
@@ -308,6 +317,24 @@ class InMemoryRuntimeTransaction:
             raise BudgetExceeded("budget account is already over its limit")
         self._store._data.budgets[(account.tenant_id, account.budget_name)] = deepcopy(account)
         return deepcopy(account)
+
+    def reap_expired_reservations(self) -> int:
+        now = self._now()
+        released = 0
+        for (tenant_id, _), reservation in self._store._data.reservations.items():
+            if (
+                tenant_id != self._tenant()
+                or reservation.status != ReservationStatus.RESERVED
+                or reservation.expires_at > now
+            ):
+                continue
+            account = self._store._data.budgets[(tenant_id, reservation.budget_name)]
+            account.reserved_units -= reservation.estimated_units
+            account.version += 1
+            reservation.status = ReservationStatus.EXPIRED
+            reservation.settled_at = now
+            released += 1
+        return released
 
     def claim_execution(
         self, inbox_id: str, worker_id: str, lease_seconds: int, budget_estimates: dict[str, int]
@@ -322,6 +349,7 @@ class InMemoryRuntimeTransaction:
             )
         inbox = self._require_inbox(inbox_id)
         now = self._now()
+        self.reap_expired_reservations()
         session = self._get_or_create_session(inbox)
         claimable = inbox.status in {
             InboxStatus.RECEIVED,
@@ -400,6 +428,13 @@ class InMemoryRuntimeTransaction:
         attempts = self._store._data.attempts[(claim.tenant_id, claim.execution_id)]
         attempts[-1].lease_expires_at = session.lease_expires_at
         attempts[-1].status = AttemptStatus.RUNNING
+        for (tenant_id, _), reservation in self._store._data.reservations.items():
+            if (
+                tenant_id == self._tenant()
+                and reservation.execution_id == claim.execution_id
+                and reservation.status == ReservationStatus.RESERVED
+            ):
+                reservation.expires_at = session.lease_expires_at
         return ExecutionClaim(
             tenant_id=claim.tenant_id,
             inbox_id=claim.inbox_id,

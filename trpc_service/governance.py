@@ -53,8 +53,26 @@ class RateLimitFilter:
 class BudgetFilter:
     """Marker filter: hard reservation is delegated to PlatformRuntime/SQL facts."""
 
-    def estimates(self, text: str, *, minimum: int = 1) -> dict[str, int]:
-        return {"model_tokens": max(minimum, len(text.split()))}
+    def estimates(
+        self,
+        text: str,
+        *,
+        max_output_tokens: int,
+        input_overhead_tokens: int = 256,
+        minimum: int = 1,
+    ) -> dict[str, int]:
+        """Reserve an upper bound before the model provider can charge us.
+
+        The prompt includes release instructions and bounded session context, so
+        word-counting the inbound text alone is insufficient.  The configurable
+        input overhead is deliberately conservative; actual reported usage is
+        reconciled at commit time and an absent report settles at this reserve.
+        """
+
+        if max_output_tokens < 1 or input_overhead_tokens < 0:
+            raise ValueError("model token reservation bounds must be non-negative")
+        estimated_input = max(minimum, len(text.split())) + input_overhead_tokens
+        return {"model_tokens": estimated_input + max_output_tokens}
 
 
 class _DLPFilter:

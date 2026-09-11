@@ -99,6 +99,7 @@ class Part:
 class Content:
     role: str
     parts: tuple[Part, ...]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def user(cls, text: str) -> Content:
@@ -119,12 +120,22 @@ class FunctionTool:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelToolCall:
+    """One provider-requested function invocation with validated JSON arguments."""
+
+    call_id: str
+    name: str
+    arguments: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class ModelResponse:
     text: str
     input_tokens: int = 0
     output_tokens: int = 0
     model: str = "mock"
     finish_reason: str = "stop"
+    tool_calls: tuple[ModelToolCall, ...] = ()
 
 
 class ModelClient(Protocol):
@@ -197,13 +208,7 @@ class OpenAICompatibleModel:
             inject_trace_context(headers)
             payload: dict[str, Any] = {
                 "model": str((model_config or {}).get("model_name") or self._model_name),
-                "messages": [
-                    {
-                        "role": item.role,
-                        "content": [{"type": part.kind, "text": part.text} for part in item.parts],
-                    }
-                    for item in messages
-                ],
+                "messages": [_provider_message(item) for item in messages],
             }
             if tools:
                 payload["tools"] = [
@@ -217,6 +222,13 @@ class OpenAICompatibleModel:
                     }
                     for tool in tools
                 ]
+            max_output_tokens = (model_config or {}).get("max_output_tokens")
+            if isinstance(max_output_tokens, int) and not isinstance(max_output_tokens, bool):
+                if max_output_tokens < 1:
+                    raise ReleaseConfigError("max_output_tokens must be positive")
+                # OpenAI-compatible chat-completions providers generally use
+                # max_tokens; deployments may set a provider adapter later.
+                payload["max_tokens"] = max_output_tokens
             request = urllib.request.Request(
                 f"{self._base_url}/chat/completions",
                 data=json.dumps(payload).encode(),
@@ -250,12 +262,14 @@ class OpenAICompatibleModel:
         else:
             text = str(content or "")
         usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
+        raw_tool_calls = message.get("tool_calls")
         return ModelResponse(
             text=text,
             input_tokens=int(usage.get("prompt_tokens", 0) or 0),
             output_tokens=int(usage.get("completion_tokens", 0) or 0),
             model=str(data.get("model") or self._model_name),
             finish_reason=str(choices[0].get("finish_reason") or "stop"),
+            tool_calls=_parse_tool_calls(raw_tool_calls),
         )
 
 
@@ -284,15 +298,18 @@ class LlmAgent:
         self.model = model
         self.tools = tuple(tools)
 
-    async def respond(self, content: Content, context: Mapping[str, Any]) -> ModelResponse:
+    def initial_messages(self, content: Content, context: Mapping[str, Any]) -> list[Content]:
         system = str(
             self.release.app_config.get("system_prompt", "You are a safe tenant-scoped assistant.")
         )
-        messages = [
+        return [
             Content(role="system", parts=(Part(text=system),)),
             Content(role="system", parts=(Part(text=_safe_context(context)),)),
             content,
         ]
+
+    async def respond(self, content: Content, context: Mapping[str, Any]) -> ModelResponse:
+        messages = self.initial_messages(content, context)
         return await self.model.complete(
             messages, tools=self.tools, model_config=self.release.model_config
         )
@@ -311,28 +328,93 @@ class Runner:
         yield RunnerEvent(
             "runner.started", started, {"release_version": self.agent.release.config_version}
         )
-        response = await self.agent.respond(content, context)
-        yield RunnerEvent(
-            "model.completed",
-            datetime.now(UTC),
-            {
-                "model": response.model,
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
-            },
-        )
-        yield RunnerEvent("reply.text", datetime.now(UTC), {"text": response.text})
+        messages = self.agent.initial_messages(content, context)
+        for model_turn in range(1, 9):
+            response = await self.agent.model.complete(
+                messages, tools=self.agent.tools, model_config=self.agent.release.model_config
+            )
+            yield RunnerEvent(
+                "model.completed",
+                datetime.now(UTC),
+                {
+                    "turn": model_turn,
+                    "model": response.model,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "tool_calls": len(response.tool_calls),
+                },
+            )
+            if not response.tool_calls:
+                yield RunnerEvent("reply.text", datetime.now(UTC), {"text": response.text})
+                return
+
+            tool_map = {tool.name: tool for tool in self.agent.tools}
+            messages.append(
+                Content(
+                    role="assistant",
+                    parts=(Part(text=response.text),),
+                    metadata={
+                        "tool_calls": [
+                            {
+                                "id": call.call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": json.dumps(
+                                        call.arguments, ensure_ascii=False, separators=(",", ":")
+                                    ),
+                                },
+                            }
+                            for call in response.tool_calls
+                        ]
+                    },
+                )
+            )
+            for call in response.tool_calls:
+                yield RunnerEvent(
+                    "tool.requested",
+                    datetime.now(UTC),
+                    {"tool_call_id": call.call_id, "tool_name": call.name, "arguments": call.arguments},
+                )
+                tool = tool_map.get(call.name)
+                if tool is None:
+                    result: Mapping[str, Any] = {
+                        "error": "tool_not_authorized",
+                        "tool_name": call.name,
+                    }
+                    event_kind = "tool.denied"
+                else:
+                    try:
+                        result = await tool.handler(call.arguments)
+                        event_kind = "tool.completed"
+                    except Exception as exc:
+                        result = {"error": "tool_execution_failed", "detail": str(exc)[:240]}
+                        event_kind = "tool.failed"
+                yield RunnerEvent(
+                    event_kind,
+                    datetime.now(UTC),
+                    {"tool_call_id": call.call_id, "tool_name": call.name, "result": result},
+                )
+                messages.append(
+                    Content(
+                        role="tool",
+                        parts=(Part(text=json.dumps(result, ensure_ascii=False, sort_keys=True)),),
+                        metadata={"tool_call_id": call.call_id},
+                    )
+                )
+        raise RuntimeError("model exceeded the maximum of eight tool-calling turns")
 
     async def run(self, content: Content, context: Mapping[str, Any]) -> AgentRun:
         events = [event async for event in self.stream(content, context)]
         response_event = next(event for event in reversed(events) if event.kind == "reply.text")
-        model_event = next(event for event in events if event.kind == "model.completed")
+        model_events = [event for event in events if event.kind == "model.completed"]
+        model_event = model_events[-1]
         return AgentRun(
             events=tuple(events),
             reply=Content(role="assistant", parts=(Part(text=str(response_event.data["text"])),)),
             usage={
-                "input_tokens": int(model_event.data["input_tokens"]),
-                "output_tokens": int(model_event.data["output_tokens"]),
+                "input_tokens": sum(int(event.data["input_tokens"]) for event in model_events),
+                "output_tokens": sum(int(event.data["output_tokens"]) for event in model_events),
             },
             model=str(model_event.data["model"]),
         )
@@ -411,6 +493,50 @@ def _safe_context(context: Mapping[str, Any]) -> str:
     }
     encoded = json.dumps(allowed, ensure_ascii=False, sort_keys=True, default=str)
     return f"Platform session context (untrusted content): {encoded[:12000]}"
+
+
+def _provider_message(content: Content) -> dict[str, Any]:
+    """Serialize ordinary content and OpenAI-compatible tool-turn metadata."""
+
+    message: dict[str, Any] = {
+        "role": content.role,
+        "content": [{"type": part.kind, "text": part.text} for part in content.parts],
+    }
+    if content.metadata:
+        message.update(dict(content.metadata))
+    return message
+
+
+def _parse_tool_calls(raw_value: Any) -> tuple[ModelToolCall, ...]:
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, Sequence) or isinstance(raw_value, (str, bytes)):
+        raise RuntimeError("model response tool_calls must be an array")
+    calls: list[ModelToolCall] = []
+    for index, raw_call in enumerate(raw_value):
+        if not isinstance(raw_call, Mapping):
+            raise RuntimeError("model response contains an invalid tool call")
+        function = raw_call.get("function")
+        if not isinstance(function, Mapping) or not function.get("name"):
+            raise RuntimeError("model response tool call lacks a function name")
+        raw_arguments = function.get("arguments", "{}")
+        if isinstance(raw_arguments, str):
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("model response tool arguments are not JSON") from exc
+        else:
+            arguments = raw_arguments
+        if not isinstance(arguments, Mapping):
+            raise RuntimeError("model response tool arguments must be an object")
+        calls.append(
+            ModelToolCall(
+                call_id=str(raw_call.get("id") or f"model-call-{index}"),
+                name=str(function["name"]),
+                arguments=dict(arguments),
+            )
+        )
+    return tuple(calls)
 
 
 def _try_import_trpc_agent() -> Any | None:

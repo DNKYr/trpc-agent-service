@@ -211,6 +211,26 @@ def test_concurrent_hard_budget_reservation_cannot_overspend():
     assert sorted(results) == ["claimed", "rejected"]
 
 
+def test_expired_budget_reservations_are_reaped_and_renewal_extends_them():
+    clock, runtime, context, _ = make_runtime()
+    runtime.put_budget_account(context, BudgetAccount("tenant-a", "model", "tokens", limit_units=10))
+    first = runtime.accept_inbound(context, envelope("provider:first", session="budget-first")).inbox
+    claim = runtime.claim_execution(
+        context, first.inbox_id, "worker", lease_seconds=5, budget_estimates={"model": 10}
+    )
+    clock.advance(4)
+    runtime.renew_execution(context, claim, lease_seconds=5)
+    clock.advance(2)
+    assert runtime.reap_expired_reservations(context) == 0
+
+    clock.advance(4)
+    assert runtime.reap_expired_reservations(context) == 1
+    second = runtime.accept_inbound(context, envelope("provider:second", session="budget-second")).inbox
+    runtime.claim_execution(
+        context, second.inbox_id, "worker", lease_seconds=5, budget_estimates={"model": 10}
+    )
+
+
 def test_tool_unknown_is_not_automatically_retried_and_reply_memory_are_durable():
     _, runtime, context, _ = make_runtime()
     inbox = runtime.accept_inbound(context, envelope("provider:1")).inbox
@@ -258,6 +278,42 @@ def test_tool_unknown_is_not_automatically_retried_and_reply_memory_are_durable(
         "memory.project",
         "reply.dispatch",
     }
+
+
+def test_same_session_can_emit_a_reply_for_each_inbound_message():
+    _, runtime, context, _ = make_runtime()
+    first = runtime.accept_inbound(context, envelope("provider:one")).inbox
+    first_claim = runtime.claim_execution(context, first.inbox_id, "worker")
+    first_reply = runtime.commit_execution(
+        context,
+        first_claim,
+        CommitInput(
+            expected_session_version=0,
+            new_state={"reply": "one"},
+            reply=ReplyDraft(blocks=[{"type": "text", "text": "one"}]),
+        ),
+    )
+    second = runtime.accept_inbound(context, envelope("provider:two")).inbox
+    second_claim = runtime.claim_execution(context, second.inbox_id, "worker")
+    second_reply = runtime.commit_execution(
+        context,
+        second_claim,
+        CommitInput(
+            expected_session_version=1,
+            new_state={"reply": "two"},
+            reply=ReplyDraft(blocks=[{"type": "text", "text": "two"}]),
+        ),
+    )
+
+    assert first_reply.reply_outbox is not None
+    assert second_reply.reply_outbox is not None
+    assert first_reply.reply_outbox.outbox_id != second_reply.reply_outbox.outbox_id
+    replies = [
+        row
+        for row in runtime.snapshot(context)["outbox"]
+        if row["event_type"] == "reply.dispatch"
+    ]
+    assert len(replies) == 2
 
 
 def test_migration_drains_fences_and_cutover_rejects_old_worker():

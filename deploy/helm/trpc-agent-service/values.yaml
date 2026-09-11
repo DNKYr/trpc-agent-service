@@ -11,17 +11,37 @@ secrets:
   # Supply this Secret out-of-band (External Secrets, Sealed Secrets, or your
   # cloud secret manager). Expected keys are documented in README.md.
   existingSecret: trpc-agent-service-secrets
+  # Each workload receives only the database URL it needs.  Keep the database
+  # role passwords in distinct Secret keys; do not use envFrom for all of them.
+  keys:
+    apiDatabaseUrl: TRPC_SERVICE_API_DATABASE_URL
+    workerDatabaseUrl: TRPC_SERVICE_WORKER_DATABASE_URL
+    dispatcherDatabaseUrl: TRPC_SERVICE_DISPATCHER_DATABASE_URL
+    migratorDatabaseUrl: TRPC_SERVICE_MIGRATOR_DATABASE_URL
+    aibotDatabaseUrl: TRPC_SERVICE_AIBOT_DATABASE_URL
+    redisUrl: TRPC_SERVICE_REDIS_URL
+    adminApiKey: TRPC_SERVICE_ADMIN_API_KEY
+    tenantApiKeys: TRPC_SERVICE_TENANT_API_KEYS
+    agentApiKey: TRPC_AGENT_API_KEY
+    wecomAibotSecret: TRPC_LIVE_WECOM_AIBOT_SECRET
   externalSecret:
     enabled: false
     secretStoreRef: platform-secrets
     targetName: trpc-agent-service-secrets
     remoteKeys:
-      databaseUrl: prod/trpc-agent/database-url
+      apiDatabaseUrl: prod/trpc-agent/api-database-url
+      workerDatabaseUrl: prod/trpc-agent/worker-database-url
+      dispatcherDatabaseUrl: prod/trpc-agent/dispatcher-database-url
+      migratorDatabaseUrl: prod/trpc-agent/migrator-database-url
+      aibotDatabaseUrl: prod/trpc-agent/aibot-database-url
+      adminApiKey: prod/trpc-agent/admin-api-key
+      tenantApiKeys: prod/trpc-agent/tenant-api-keys
       redisUrl: prod/trpc-agent/redis-url
       agentApiKey: prod/trpc-agent/model-api-key
       wecomAibotSecret: prod/trpc-agent/wecom-aibot-secret
 
 config:
+  environment: production
   runtimeBackend: postgres
   workerId: worker
   dispatcherId: dispatcher

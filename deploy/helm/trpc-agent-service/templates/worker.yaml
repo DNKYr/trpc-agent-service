@@ -30,8 +30,18 @@ spec:
           args: ["python", "-m", "trpc_service._cli", "worker", "--no-once"]
           envFrom:
             - configMapRef: {name: {{ include "trpc-agent-service.fullname" . }}}
-            - secretRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}}
           env:
+            - name: TRPC_SERVICE_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.workerDatabaseUrl }}}
+            - name: TRPC_SERVICE_DATABASE_ROLE
+              value: agent_worker
+            - name: TRPC_SERVICE_REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.redisUrl }}}
+            - name: TRPC_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.agentApiKey }}, optional: true}
             - name: TRPC_SERVICE_WORKER_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
           securityContext:

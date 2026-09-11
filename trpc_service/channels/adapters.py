@@ -185,6 +185,20 @@ class ChannelAdapter(Protocol):
         """Persisted delivery callers invoke this only after creating a delivery attempt."""
 
 
+class QueryableDeliveryAdapter(ChannelAdapter, Protocol):
+    """A provider that can prove the result of a previous delivery attempt."""
+
+    async def reconcile_delivery(
+        self,
+        binding: ChannelBinding,
+        reply: ReplyEnvelope,
+        *,
+        provider_message_id: str | None,
+        provider_idempotency_key: str | None,
+    ) -> DeliveryResult | None:
+        """Return a concrete result or ``None`` when the provider is still inconclusive."""
+
+
 def deterministic_session_id(
     binding: ChannelBinding,
     *,
@@ -461,7 +475,7 @@ class WeComAdapter:
         if status == 200 and int(data.get("errcode", -1)) == 0:
             message_id = str(data.get("msgid") or _stable_id("wecom_delivery", reply.delivery_id))
             return DeliveryResult(
-                "accepted", DeliveryCapability.QUERYABLE, provider_message_id=message_id
+                "accepted", DeliveryCapability.NON_RETRIABLE, provider_message_id=message_id
             )
         return _wecom_delivery_error(status, data)
 
@@ -477,11 +491,11 @@ def _wecom_delivery_error(status: int, data: Mapping[str, Any]) -> DeliveryResul
     code = str(data.get("errcode", f"http_{status}"))
     if status == 429 or code in {"45009", "45011"}:
         return DeliveryResult(
-            "failed", DeliveryCapability.QUERYABLE, error_code=code, retry_after_seconds=1
+            "failed", DeliveryCapability.NON_RETRIABLE, error_code=code, retry_after_seconds=1
         )
     if status >= 500:
-        return DeliveryResult("failed", DeliveryCapability.QUERYABLE, error_code=code)
-    return DeliveryResult("failed", DeliveryCapability.QUERYABLE, error_code=code)
+        return DeliveryResult("failed", DeliveryCapability.NON_RETRIABLE, error_code=code)
+    return DeliveryResult("failed", DeliveryCapability.NON_RETRIABLE, error_code=code)
 
 
 class TelegramAdapter:

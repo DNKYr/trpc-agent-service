@@ -73,8 +73,8 @@ def _json(value: Any) -> Any:
 class PostgresRuntimeStore:
     """A transaction-per-operation runtime store backed by PostgreSQL rows."""
 
-    def __init__(self, database_url: str) -> None:
-        self._connections = PostgresConnections(database_url)
+    def __init__(self, database_url: str, database_role: str | None = None) -> None:
+        self._connections = PostgresConnections(database_url, database_role)
 
     def bootstrap_tenant(self, tenant_id: str, *, storage_profile: dict[str, Any] | None = None):
         """Return an already-provisioned tenant state.
@@ -489,6 +489,16 @@ class PostgresRuntimeTransaction:
         if row is None:
             raise LeaseLost("outbox is no longer leased by dispatcher")
 
+    def requeue_outbox(self, outbox_id: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE outbox SET status = 'pending', available_at = %s,
+            lease_owner = NULL, lease_expires_at = NULL
+            WHERE tenant_id = %s AND outbox_id = %s AND status <> 'delivered'
+            """,
+            (_now(), self._tenant(), outbox_id),
+        )
+
     def put_budget_account(self, account: BudgetAccount) -> BudgetAccount:
         if account.tenant_id != self._tenant():
             raise TenantMismatch("budget account belongs to another tenant")
@@ -523,6 +533,45 @@ class PostgresRuntimeTransaction:
         ).fetchone()
         return self._account(row)
 
+    def reap_expired_reservations(self) -> int:
+        now = _now()
+        reservations = self.connection.execute(
+            """
+            SELECT * FROM budget_reservation
+            WHERE tenant_id = %s AND status = 'reserved' AND expires_at <= %s
+            FOR UPDATE
+            """,
+            (self._tenant(), now),
+        ).fetchall()
+        for reservation in reservations:
+            updated = self.connection.execute(
+                """
+                UPDATE budget_account
+                SET reserved_units = reserved_units - %s, version = version + 1, updated_at = %s
+                WHERE tenant_id = %s AND budget_name = %s AND period_start = %s
+                  AND reserved_units >= %s
+                RETURNING budget_name
+                """,
+                (
+                    reservation["estimated_units"],
+                    now,
+                    self._tenant(),
+                    reservation["budget_name"],
+                    reservation["period_start"],
+                    reservation["estimated_units"],
+                ),
+            ).fetchone()
+            if updated is None:
+                raise ExecutionDivergence("expired budget reservation has no matching reserved balance")
+            self.connection.execute(
+                """
+                UPDATE budget_reservation SET status = 'expired', settled_at = %s
+                WHERE tenant_id = %s AND reservation_id = %s
+                """,
+                (now, self._tenant(), reservation["reservation_id"]),
+            )
+        return len(reservations)
+
     @staticmethod
     def _account(row: dict[str, Any]) -> BudgetAccount:
         return BudgetAccount(
@@ -550,6 +599,7 @@ class PostgresRuntimeTransaction:
             )
         inbox = self._inbox(self._inbox_row(inbox_id, lock=True))
         now = _now()
+        self.reap_expired_reservations()
         self.connection.execute(
             """
             INSERT INTO session
@@ -681,6 +731,13 @@ class PostgresRuntimeTransaction:
             WHERE tenant_id = %s AND execution_id = %s AND attempt_no = %s
             """,
             (expiry, self._tenant(), claim.execution_id, claim.attempt_no),
+        )
+        self.connection.execute(
+            """
+            UPDATE budget_reservation SET expires_at = %s
+            WHERE tenant_id = %s AND execution_id = %s AND status = 'reserved'
+            """,
+            (expiry, self._tenant(), claim.execution_id),
         )
         return ExecutionClaim(
             tenant_id=claim.tenant_id,

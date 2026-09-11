@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool
@@ -13,6 +14,9 @@ if config.config_file_name:
 url = os.environ.get("TRPC_SERVICE_DATABASE_URL", config.get_main_option("sqlalchemy.url"))
 url = url.replace("postgresql+asyncpg://", "postgresql+psycopg://")
 config.set_main_option("sqlalchemy.url", url)
+database_role = os.environ.get("TRPC_SERVICE_DATABASE_ROLE") or None
+if database_role is not None and not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database_role):
+    raise RuntimeError("TRPC_SERVICE_DATABASE_ROLE is not a valid PostgreSQL role identifier")
 
 
 def run_migrations_offline() -> None:
@@ -28,6 +32,8 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
+        if database_role is not None:
+            connection.exec_driver_sql(f"SET ROLE {database_role}")
         context.configure(connection=connection)
         with context.begin_transaction():
             context.run_migrations()

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field, is_dataclass
 from hashlib import sha256
+from hmac import compare_digest
 from secrets import token_urlsafe
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from trpc_service.agent import AgentFactory, ImmutableRelease
+from trpc_service.agent import AgentFactory, FunctionTool, ImmutableRelease
 from trpc_service.channels import (
     AIBotRegistry,
     CallbackRequest,
@@ -33,6 +35,7 @@ from trpc_service.config import (
 )
 from trpc_service.control import Binding, ControlConflict, ControlNotFound, ControlPlane
 from trpc_service.db import PostgresControlPlane
+from trpc_service.db.postgres import PostgresConnections
 from trpc_service.governance import (
     BudgetFilter,
     InputDLPFilter,
@@ -58,9 +61,17 @@ from trpc_service.runtime import (
     RuntimeErrorBase,
     SessionEventDraft,
     TenantContext,
+    ToolCapability,
     ToolStatus,
     stable_id,
     to_primitive,
+)
+from trpc_service.tool import (
+    MockSideEffectTool,
+    TicketLookupTool,
+    ToolInvocation,
+    ToolPolicy,
+    ToolPolicyFilter,
 )
 
 from .schemas import (
@@ -77,6 +88,18 @@ from .schemas import (
     TenantCreate,
     TenantResponse,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthPrincipal:
+    """The authenticated HTTP caller, never including its credential."""
+
+    kind: str
+    tenant_id: str | None = None
+
+    @property
+    def is_admin(self) -> bool:
+        return self.kind == "admin"
 
 
 def _json(value: Any) -> Any:
@@ -102,6 +125,12 @@ def _session_for_api(
     return "ses_api_" + sha256(material).hexdigest()[:32]
 
 
+def _api_binding_id(agent_id: str) -> str:
+    """Return a reserved durable binding for queued API-originated work."""
+
+    return f"api.{agent_id}"
+
+
 @dataclass(slots=True)
 class ServiceContainer:
     """Process-local composition root.
@@ -122,6 +151,7 @@ class ServiceContainer:
     secrets: Any = field(init=False)
     agent_factory: AgentFactory = field(init=False)
     adapters: dict[str, Any] = field(init=False)
+    tools: dict[str, Any] = field(init=False)
     aibot_registry: AIBotRegistry = field(init=False)
     principal_filter: PrincipalFilter = field(default_factory=PrincipalFilter)
     rate_limit_filter: RateLimitFilter = field(default_factory=RateLimitFilter)
@@ -131,11 +161,15 @@ class ServiceContainer:
 
     def __post_init__(self) -> None:
         if self.settings.runtime_backend == "postgres":
-            self.control = PostgresControlPlane(self.settings.database_url)
-            self.store = PostgresRuntimeStore(self.settings.database_url)
+            self.control = PostgresControlPlane(
+                self.settings.database_url, self.settings.database_role
+            )
+            self.store = PostgresRuntimeStore(self.settings.database_url, self.settings.database_role)
             self.bus = RedisStreamMessageBus(self.settings.redis_url)
             self.secrets = EnvironmentSecretProvider()
-            self.delivery_ledger = PostgresDeliveryLedger(self.settings.database_url)
+            self.delivery_ledger = PostgresDeliveryLedger(
+                self.settings.database_url, self.settings.database_role
+            )
         elif self.settings.runtime_backend == "memory":
             self.control = ControlPlane()
             self.store = InMemoryRuntimeStore()
@@ -152,6 +186,12 @@ class ServiceContainer:
             "telegram": TelegramAdapter(self.secrets),
             "wecom": WeComAdapter(self.secrets),
             "wecom_aibot": WeComAIBotAdapter(self.aibot_registry),
+        }
+        # Tools remain registered in the process, but each execution exposes
+        # only the immutable release allowlist through FunctionTool wrappers.
+        self.tools = {
+            "ticket.lookup": TicketLookupTool(),
+            "mock.side_effect": MockSideEffectTool(),
         }
 
     def create_tenant(self, body: TenantCreate) -> dict[str, Any]:
@@ -195,9 +235,38 @@ class ServiceContainer:
         return tenant
 
     def create_agent(self, tenant_id: str, body: AgentCreate) -> dict[str, Any]:
-        return self.control.serialize(
-            self.control.create_agent(tenant_id, body.agent_id, body.name)
-        )
+        agent = self.control.create_agent(tenant_id, body.agent_id, body.name)
+        self._ensure_api_binding(tenant_id, body.agent_id)
+        return self.control.serialize(agent)
+
+    def _ensure_api_binding(self, tenant_id: str, agent_id: str) -> Binding:
+        """Create the internal source record required by Inbox/Session FKs.
+
+        Direct runs are first-class queued work, not a pretend external channel
+        and not an inline execution shortcut.  The binding is intentionally
+        unaddressable: no callback route or adapter exists for ``provider=api``.
+        """
+
+        binding_id = _api_binding_id(agent_id)
+        try:
+            binding = self.control.binding(tenant_id, binding_id)
+        except ControlNotFound:
+            try:
+                binding = self.control.create_binding(
+                    tenant_id,
+                    binding_id=binding_id,
+                    agent_id=agent_id,
+                    provider="api",
+                    external_account_id=f"internal-api:{tenant_id}:{agent_id}",
+                    webhook_key=token_urlsafe(32),
+                    secret_ref="internal://direct-run",
+                    capabilities={"internal": True, "source_type": "api"},
+                )
+            except ControlConflict:
+                binding = self.control.binding(tenant_id, binding_id)
+        if binding.provider != "api" or binding.agent_id != agent_id:
+            raise ControlConflict(f"reserved API binding {binding_id!r} is not valid for this agent")
+        return binding
 
     def create_release(self, tenant_id: str, agent_id: str, body: ReleaseCreate) -> dict[str, Any]:
         release = self.control.create_release(
@@ -220,6 +289,8 @@ class ServiceContainer:
         return self.control.serialize(self.control.rollback_agent(tenant_id, agent_id))
 
     def create_binding(self, tenant_id: str, body: ChannelCreate) -> dict[str, Any]:
+        if body.binding_id.startswith("api."):
+            raise ValueError("binding IDs starting with 'api.' are reserved for direct-run sources")
         if body.provider != "wecom_aibot" and not body.webhook_key:
             raise ValueError("webhook_key is required for callback-based channels")
         # Long connections authenticate to WeCom instead of a public callback.
@@ -335,6 +406,182 @@ class ServiceContainer:
             on_inbound=self.accept_aibot_frame,
         )
 
+    def readiness(self) -> tuple[bool, dict[str, str]]:
+        """Check dependencies used by this process without weakening liveness."""
+
+        if self.settings.runtime_backend == "memory":
+            return True, {"runtime_backend": "memory"}
+        failures: dict[str, str] = {}
+        try:
+            PostgresConnections(self.settings.database_url, self.settings.database_role).check()
+        except Exception:
+            failures["postgres"] = "unavailable"
+        try:
+            self.bus.check()
+        except Exception:
+            failures["redis"] = "unavailable"
+        if failures:
+            return False, failures
+        return True, {"runtime_backend": self.settings.runtime_backend}
+
+    async def _run_with_execution_heartbeat(
+        self,
+        context: TenantContext,
+        claim: Any,
+        operation: Any,
+    ) -> tuple[Any, Any]:
+        """Renew the fenced execution lease while an external operation runs."""
+
+        current_claim = claim
+        stop = asyncio.Event()
+        renewal_error: Exception | None = None
+        interval = self.settings.execution_heartbeat_seconds
+
+        async def renew() -> None:
+            nonlocal current_claim, renewal_error
+            while True:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                    return
+                except TimeoutError:
+                    try:
+                        current_claim = self.runtime.renew_execution(
+                            context,
+                            current_claim,
+                            lease_seconds=self.settings.execution_lease_seconds,
+                        )
+                    except Exception as exc:  # commit must be fenced after model return.
+                        renewal_error = exc
+                        return
+
+        task = asyncio.create_task(renew())
+        try:
+            result = await operation
+        finally:
+            stop.set()
+            await task
+        if renewal_error is not None:
+            raise renewal_error
+        return result, current_claim
+
+    def _session_context(self, context: TenantContext, inbox: Mapping[str, Any]) -> dict[str, Any]:
+        """Load persisted session events and memory before constructing model input."""
+
+        snapshot = self.runtime.snapshot(context)
+        session_id = str(inbox["session_id"])
+        subject_id = str(inbox.get("subject_id") or "")
+        memories = [
+            {
+                "memory_id": row["memory_id"],
+                "type": row["memory_type"],
+                "content": row["content"],
+            }
+            for row in snapshot["memories"]
+            if row.get("content")
+            and (
+                row.get("session_id") == session_id
+                or (subject_id and row.get("subject_id") == subject_id)
+            )
+        ][-20:]
+        history = [
+            row
+            for row in snapshot["events"]
+            if row.get("session_id") == session_id and row.get("role") in {"user", "assistant"}
+        ][-12:]
+        summary = "\n".join(
+            f"{row['role']}: {str(row.get('payload', {}).get('text', ''))[:1000]}"
+            for row in history
+            if isinstance(row.get("payload"), Mapping)
+        )
+        return {"memory": memories, "summary": summary}
+
+    def _execution_tools(
+        self,
+        context: TenantContext,
+        claim: Any,
+        inbox: Mapping[str, Any],
+        release: ImmutableRelease,
+    ) -> tuple[FunctionTool, ...]:
+        """Bind model-visible tools to the persistent intent ledger and fence."""
+
+        state = self.runtime.runtime_state(context)
+        policy = ToolPolicy.from_release(release.tool_policy, live_denylist=state.tool_denylist)
+        subject_id = str(inbox.get("subject_id") or "anonymous")
+        step = 0
+        bound: list[FunctionTool] = []
+        for name in sorted(policy.allowlist):
+            tool = self.tools.get(name)
+            if tool is None or name in policy.denylist:
+                continue
+
+            async def handler(arguments: Mapping[str, Any], *, selected_tool=tool) -> Mapping[str, Any]:
+                nonlocal step
+                invocation = ToolInvocation(
+                    name=selected_tool.name,
+                    step=step,
+                    arguments=dict(arguments),
+                    principal_id=subject_id,
+                    trace_id=context.trace_id,
+                )
+                step += 1
+                ToolPolicyFilter(policy).authorize(selected_tool, invocation)
+                intent = self.runtime.prepare_tool(
+                    context,
+                    claim,
+                    tool_step=invocation.step,
+                    tool_name=selected_tool.name,
+                    arguments=invocation.arguments,
+                    capability=ToolCapability(selected_tool.retry_capability.value),
+                )
+                started = self.runtime.start_tool(context, claim, intent.tool_call_id)
+                if started.status == ToolStatus.SUCCEEDED:
+                    return dict(started.result or {})
+                if started.status in {
+                    ToolStatus.UNKNOWN,
+                    ToolStatus.RECONCILING,
+                    ToolStatus.MANUAL_REVIEW,
+                }:
+                    raise RuntimeError("tool operation requires reconciliation or manual resolution")
+                try:
+                    self.runtime.assert_execution(context, claim)
+                    result = await selected_tool.call(
+                        invocation.arguments,
+                        claim=claim,
+                        idempotency_key=intent.provider_idempotency_key,
+                    )
+                except Exception as exc:
+                    self.runtime.finish_tool(
+                        context,
+                        claim,
+                        intent.tool_call_id,
+                        status=ToolStatus.UNKNOWN,
+                        error_code="tool_provider_ambiguous",
+                    )
+                    raise RuntimeError("tool provider outcome is unknown") from exc
+                completed = self.runtime.finish_tool(
+                    context,
+                    claim,
+                    intent.tool_call_id,
+                    status=ToolStatus.SUCCEEDED,
+                    result=result,
+                    provider_operation_id=(
+                        str(result["provider_operation_id"])
+                        if result.get("provider_operation_id") is not None
+                        else None
+                    ),
+                )
+                return dict(completed.result or {})
+
+            bound.append(
+                FunctionTool(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.parameters,
+                    handler=handler,
+                )
+            )
+        return tuple(bound)
+
     async def execute_inbox(
         self, context: TenantContext, inbox_id: str, worker_id: str
     ) -> dict[str, Any]:
@@ -344,17 +591,9 @@ class ServiceContainer:
         inbox = next((row for row in snapshot["inboxes"] if row["inbox_id"] == inbox_id), None)
         if inbox is None:
             raise KeyError("inbox does not exist")
-        claim = self.runtime.claim_execution(
-            context,
-            inbox_id,
-            worker_id,
-            lease_seconds=60,
-            budget_estimates=self.budget_filter.estimates(str(inbox["payload"].get("text", ""))),
+        release_record = self.control.release(
+            context.tenant_id, str(inbox["agent_id"]), int(inbox["config_version"])
         )
-        # Fence/security check immediately before the model call.  Commit repeats
-        # the predicates inside its transaction so a stale worker cannot write.
-        self.runtime.assert_execution(context, claim)
-        release_record = self.control.active_release(context.tenant_id, str(inbox["agent_id"]))
         release = ImmutableRelease(
             tenant_id=release_record.tenant_id,
             agent_id=release_record.agent_id,
@@ -364,22 +603,59 @@ class ServiceContainer:
             tool_policy=release_record.tool_policy,
             knowledge_config=release_record.knowledge_config,
         )
-        agent = await self.agent_factory.build(release)
+        max_output_tokens = int(
+            release.model_config.get("max_output_tokens", self.settings.model_max_output_tokens)
+        )
+        if max_output_tokens < 1:
+            raise ValueError("release model_config.max_output_tokens must be positive")
+        budget_estimates = self.budget_filter.estimates(
+            str(inbox["payload"].get("text", "")),
+            max_output_tokens=max_output_tokens,
+            input_overhead_tokens=self.settings.model_input_overhead_tokens,
+        )
+        claim = self.runtime.claim_execution(
+            context,
+            inbox_id,
+            worker_id,
+            lease_seconds=self.settings.execution_lease_seconds,
+            budget_estimates=budget_estimates,
+        )
+        # Fence/security check immediately before the model call.  Commit repeats
+        # the predicates inside its transaction so a stale worker cannot write.
+        self.runtime.assert_execution(context, claim)
+        if claim.config_version != release.config_version:
+            raise RuntimeError("execution claim release version disagrees with its durable Inbox")
+        agent = await self.agent_factory.build(
+            release, tools=self._execution_tools(context, claim, inbox, release)
+        )
         input_text = str(inbox["payload"].get("text", ""))
         self.principal_filter.check(
             Principal(context.tenant_id, str(inbox.get("subject_id") or "anonymous"))
         )
         self.rate_limit_filter.check(context.tenant_id, str(inbox.get("subject_id") or "anonymous"))
         self.input_dlp_filter.check(input_text)
-        result = await agent.run(input_text, {"memory": [], "summary": ""})
+        result, claim = await self._run_with_execution_heartbeat(
+            context,
+            claim,
+            agent.run(input_text, self._session_context(context, inbox)),
+        )
         self.runtime.assert_execution(context, claim)
         events = [
             SessionEventDraft(
+                event_type="user.message",
+                role="user",
+                payload={"text": input_text, "inbox_id": inbox_id},
+                subject_id=inbox.get("subject_id"),
+                external_message_id=inbox.get("external_message_id"),
+            ),
+            *[
+            SessionEventDraft(
                 event_type=event.kind,
                 role="assistant" if event.kind == "reply.text" else None,
-                payload=dict(event.data),
+                payload={**dict(event.data), "inbox_id": inbox_id},
             )
             for event in result.events
+            ],
         ]
         reply = result.reply.text()
         self.output_dlp_filter.check(reply)
@@ -388,7 +664,7 @@ class ServiceContainer:
             claim,
             CommitInput(
                 expected_session_version=claim.session_version,
-                new_state={"last_reply": reply, "model": result.model},
+                new_state={"last_reply": reply, "last_reply_inbox_id": inbox_id, "model": result.model},
                 events=events,
                 memories=[
                     MemoryIntentDraft(
@@ -397,18 +673,29 @@ class ServiceContainer:
                         subject_id=inbox.get("subject_id"),
                     )
                 ],
-                reply=ReplyDraft(
-                    blocks=[{"type": "text", "text": reply}],
-                    channel_binding_id=str(inbox["channel_binding_id"]),
-                    recipient_id=str(
-                        inbox["payload"].get("recipient_id")
-                        or inbox.get("subject_id")
-                        or ""
-                    ),
-                    metadata=dict(inbox["payload"].get("channel_context") or {}),
+                # API-originated runs persist their response as a Session event
+                # for the operation endpoint.  They never create a fake reply
+                # delivery event that a channel dispatcher cannot acknowledge.
+                reply=(
+                    None
+                    if inbox["payload"].get("source_type") == "api"
+                    else ReplyDraft(
+                        blocks=[{"type": "text", "text": reply}],
+                        channel_binding_id=str(inbox["channel_binding_id"]),
+                        recipient_id=str(
+                            inbox["payload"].get("recipient_id")
+                            or inbox.get("subject_id")
+                            or ""
+                        ),
+                        metadata=dict(inbox["payload"].get("channel_context") or {}),
+                    )
                 ),
                 actual_budget_units={
-                    "model_tokens": result.usage["input_tokens"] + result.usage["output_tokens"]
+                    "model_tokens": (
+                        result.usage["input_tokens"] + result.usage["output_tokens"]
+                        if result.usage["input_tokens"] > 0 and result.usage["output_tokens"] > 0
+                        else budget_estimates["model_tokens"]
+                    )
                 },
             ),
         )
@@ -425,32 +712,34 @@ class ServiceContainer:
         release = self.control.active_release(tenant_id, agent_id)
         context = _context(tenant_id, request_id, trace_id, actor="api-run")
         session_id = _session_for_api(tenant_id, agent_id, body.session_key, body.subject_id)
+        binding = self._ensure_api_binding(tenant_id, agent_id)
         accepted = self.runtime.accept_inbound(
             context,
             InboundEnvelope(
                 tenant_id=tenant_id,
-                channel_binding_id="api",
+                channel_binding_id=binding.binding_id,
                 agent_id=agent_id,
                 session_id=session_id,
                 idempotency_key=body.idempotency_key or f"api:{request_id}",
                 external_message_id=None,
                 subject_id=body.subject_id,
                 config_version=release.version,
-                payload={"channel": "api", "text": body.input, "recipient_id": body.subject_id},
+                payload={
+                    "channel": "api",
+                    "source_type": "api",
+                    "text": body.input,
+                    "recipient_id": body.subject_id,
+                },
                 request_id=request_id,
                 trace_id=trace_id,
             ),
         )
-        if accepted.duplicate:
-            return {
-                "inbox_id": accepted.inbox.inbox_id,
-                "execution_id": accepted.inbox.execution_id,
-                "status": accepted.inbox.status.value,
-            }
-        executed = await self.execute_inbox(
-            context, accepted.inbox.inbox_id, self.settings.worker_id
-        )
-        return {**executed, "status": "committed"}
+        return {
+            "inbox_id": accepted.inbox.inbox_id,
+            "execution_id": accepted.inbox.execution_id,
+            "status": accepted.inbox.status.value,
+            "request_id": accepted.inbox.request_id,
+        }
 
     def dispatch(
         self, tenant_id: str, request_id: str = "", trace_id: str = ""
@@ -467,10 +756,11 @@ class ServiceContainer:
     ) -> dict[str, list[dict[str, Any]]]:
         """Lease/publish pending Outbox work independently for every active tenant."""
 
-        return {
-            tenant_id: self.dispatch(tenant_id, request_id, trace_id)
-            for tenant_id in self.control.tenant_ids()
-        }
+        published: dict[str, list[dict[str, Any]]] = {}
+        for tenant_id in self.control.tenant_ids():
+            self.runtime.reap_expired_reservations(_context(tenant_id, request_id, trace_id))
+            published[tenant_id] = self.dispatch(tenant_id, request_id, trace_id)
+        return published
 
     async def process_published(
         self, tenant_id: str | None = None, request_id: str = "", trace_id: str = ""
@@ -576,10 +866,13 @@ class ServiceContainer:
         capability_by_provider = {
             "mock": "idempotent",
             "telegram": "non_retriable",
-            "wecom": "queryable",
+            # The corporate-app send API does not expose a result query by
+            # message ID, so treating it as queryable would invite duplicate
+            # sends after a timeout.
+            "wecom": "non_retriable",
             "wecom_aibot": "non_retriable",
         }
-        capability = capability_by_provider.get(binding.provider, "queryable")
+        capability = capability_by_provider.get(binding.provider, "non_retriable")
         attempt = self.delivery_ledger.begin(
             tenant_id=tenant_id,
             outbox_id=outbox_id,
@@ -594,6 +887,54 @@ class ServiceContainer:
                 self.runtime.mark_outbox_delivered(
                     _context(tenant_id, "delivery-recovery", attempt.trace_id, actor="dispatcher"), outbox_id
                 )
+                return _json(attempt), True
+            if capability == "queryable":
+                reconcile = getattr(adapter, "reconcile_delivery", None)
+                if not callable(reconcile):
+                    final = self.delivery_ledger.finish(
+                        attempt,
+                        status="manual_review",
+                        error_code="queryable_adapter_has_no_reconciliation_operation",
+                    )
+                    return _json(final), True
+                try:
+                    reconciled = await reconcile(
+                        self.adapter_binding(binding),
+                        reply,
+                        provider_message_id=attempt.provider_message_id,
+                        provider_idempotency_key=attempt.provider_idempotency_key,
+                    )
+                except Exception as exc:
+                    final = self.delivery_ledger.finish(
+                        attempt,
+                        status="reconciling",
+                        error_code=f"reconciliation_{type(exc).__name__}",
+                    )
+                    return _json(final), False
+                if reconciled is None or reconciled.status == "reconciling":
+                    final = self.delivery_ledger.finish(
+                        attempt,
+                        status="reconciling",
+                        error_code=(reconciled.error_code if reconciled else "reconciliation_inconclusive"),
+                    )
+                    return _json(final), False
+                if reconciled.status == "accepted":
+                    final = self.delivery_ledger.finish(
+                        attempt,
+                        status="accepted",
+                        provider_message_id=reconciled.provider_message_id,
+                    )
+                    self.runtime.mark_outbox_delivered(
+                        _context(tenant_id, "delivery-reconciled", final.trace_id, actor="dispatcher"),
+                        outbox_id,
+                    )
+                    return _json(final), True
+                final = self.delivery_ledger.finish(
+                    attempt,
+                    status="manual_review",
+                    error_code=reconciled.error_code or "reconciliation_rejected",
+                )
+                return _json(final), True
             return _json(attempt), True
         try:
             result = await adapter.deliver(self.adapter_binding(binding), reply)
@@ -620,10 +961,14 @@ class ServiceContainer:
                 _context(tenant_id, "delivery", final.trace_id, actor="dispatcher"), outbox_id
             )
             return _json(final), True
-        # A provider reported a definite failure; retry it through the durable
-        # consumer-group pending list.  Unknown/manual states are intentionally
-        # terminal until an operator resolves the ledger entry.
-        return _json(final), final.status != "failed"
+        # Only a provider with a deterministic idempotency key may be resent
+        # automatically. Queryable providers stay pending for their actual
+        # reconciliation operation; non-retriable providers require a human.
+        if capability == "idempotent" and final.status == "failed":
+            return _json(final), False
+        if capability == "queryable" and final.status in {"failed", "unknown", "reconciling"}:
+            return _json(final), False
+        return _json(final), True
 
     async def deliver_replies(
         self,
@@ -689,8 +1034,18 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
     # settings must also govern HTTP authentication instead of consulting the
     # process-global cached settings a second time.
     settings = container.settings if container is not None else get_settings()
+    settings.validate_startup()
     services = container or ServiceContainer(settings)
-    app = FastAPI(title="tRPC-Agent multi-tenant platform", version="0.1.0")
+    # Do not expose framework-generated routes that would evade the API
+    # authorization policy.  Publish an authenticated specification separately if
+    # this service later needs an interactive developer portal.
+    app = FastAPI(
+        title="tRPC-Agent multi-tenant platform",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.services = services
     app.state.otel_enabled = configure_opentelemetry(
         service_name="trpc-agent-service",
@@ -710,12 +1065,52 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
     def get_services() -> ServiceContainer:
         return app.state.services
 
-    def require_admin(request: Request) -> None:
-        configured = getattr(settings, "admin_api_key", None)
-        if configured and request.headers.get("x-admin-key") != configured:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "admin_auth_required"}
-            )
+    def authentication_error(code: str, response_status: int) -> HTTPException:
+        return HTTPException(status_code=response_status, detail={"code": code})
+
+    def bearer_or_api_key(request: Request) -> str | None:
+        authorization = request.headers.get("authorization")
+        if authorization:
+            scheme, _, credential = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not credential:
+                raise authentication_error("invalid_authorization_header", status.HTTP_401_UNAUTHORIZED)
+            return credential
+        return request.headers.get("x-api-key")
+
+    def authenticate(request: Request) -> AuthPrincipal:
+        """Authenticate without ever treating missing configuration as anonymous."""
+
+        if not settings.authentication_configured:
+            raise authentication_error("authentication_unconfigured", status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        admin_credential = request.headers.get("x-admin-key")
+        if admin_credential and settings.admin_api_key and compare_digest(
+            admin_credential, settings.admin_api_key
+        ):
+            return AuthPrincipal(kind="admin")
+
+        credential = bearer_or_api_key(request)
+        if credential and settings.admin_api_key and compare_digest(
+            credential, settings.admin_api_key
+        ):
+            return AuthPrincipal(kind="admin")
+        if credential:
+            for tenant_id, tenant_key in settings.tenant_api_keys.items():
+                if compare_digest(credential, tenant_key):
+                    return AuthPrincipal(kind="tenant", tenant_id=tenant_id)
+        raise authentication_error("authentication_required", status.HTTP_401_UNAUTHORIZED)
+
+    def require_admin(request: Request) -> AuthPrincipal:
+        principal = authenticate(request)
+        if not principal.is_admin:
+            raise authentication_error("admin_authorization_required", status.HTTP_403_FORBIDDEN)
+        return principal
+
+    def require_tenant(tenant_id: str, request: Request) -> AuthPrincipal:
+        principal = authenticate(request)
+        if not principal.is_admin and principal.tenant_id != tenant_id:
+            raise authentication_error("tenant_authorization_required", status.HTTP_403_FORBIDDEN)
+        return principal
 
     @app.exception_handler(RuntimeErrorBase)
     async def runtime_error(_: Request, exc: RuntimeErrorBase) -> JSONResponse:
@@ -734,8 +1129,12 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         return {"status": "live"}
 
     @app.get("/health/ready")
-    async def ready() -> dict[str, str]:
-        return {"status": "ready", "runtime_backend": services.settings.runtime_backend}
+    async def ready() -> JSONResponse:
+        is_ready, details = services.readiness()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "ready" if is_ready else "not_ready", **details},
+        )
 
     @app.post(
         "/admin/v1/tenants",
@@ -980,7 +1379,11 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return await callback("mock", binding_key, request, services)
 
-    @app.post("/v1/tenants/{tenant_id}/agents/{agent_id}:run")
+    @app.post(
+        "/v1/tenants/{tenant_id}/agents/{agent_id}:run",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_tenant)],
+    )
     async def run_agent(
         tenant_id: str,
         agent_id: str,
@@ -992,9 +1395,10 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         result = await services.run_direct(
             tenant_id, agent_id, body, trace.request_id, trace.trace_id
         )
-        return OperationResponse(request_id=trace.request_id, trace_id=trace.trace_id, **result)
+        operation_request_id = str(result.pop("request_id", trace.request_id))
+        return OperationResponse(request_id=operation_request_id, trace_id=trace.trace_id, **result)
 
-    @app.get("/v1/operations/{request_id}")
+    @app.get("/v1/operations/{request_id}", dependencies=[Depends(require_tenant)])
     async def operation(
         request_id: str,
         tenant_id: str,
@@ -1004,7 +1408,17 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         trace = extract_trace_context(request.headers)
         snapshot = services.runtime.snapshot(_context(tenant_id, trace.request_id, trace.trace_id))
         items = [row for row in snapshot["inboxes"] if row["request_id"] == request_id]
-        return {"items": items, "request_id": request_id}
+        replies = {
+            str(event["payload"].get("inbox_id")): str(event["payload"].get("text", ""))
+            for event in snapshot["events"]
+            if event["event_type"] == "reply.text"
+            and isinstance(event.get("payload"), Mapping)
+            and event["payload"].get("inbox_id")
+        }
+        return {
+            "items": [{**item, "reply": replies.get(str(item["inbox_id"]))} for item in items],
+            "request_id": request_id,
+        }
 
     @app.get("/admin/v1/tenants/{tenant_id}/audit", dependencies=[Depends(require_admin)])
     async def audit(
@@ -1049,11 +1463,15 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         )
         if known is None:
             try:
-                return _json(
-                    services.delivery_ledger.resolve(
-                        tenant_id, operation_id, action=body.action, note=body.note
-                    )
+                resolved = services.delivery_ledger.resolve(
+                    tenant_id, operation_id, action=body.action, note=body.note
                 )
+                if body.action == "retry" and resolved.status == "reconciling":
+                    services.runtime.requeue_outbox(
+                        _context(tenant_id, trace.request_id, trace.trace_id, actor="admin"),
+                        resolved.outbox_id,
+                    )
+                return _json(resolved)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail={"code": "not_found"}) from exc
         target = {

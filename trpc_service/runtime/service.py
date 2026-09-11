@@ -128,6 +128,12 @@ class PlatformRuntime:
         with self.store.transaction(context) as tx:
             return tx.put_budget_account(account)
 
+    def reap_expired_reservations(self, context: TenantContext) -> int:
+        """Release only unpaid reservations whose execution lease has expired."""
+
+        with self.store.transaction(context) as tx:
+            return tx.reap_expired_reservations()
+
     def runtime_state(self, context: TenantContext) -> TenantRuntimeState:
         with self.store.transaction(context) as tx:
             return tx.runtime_state()
@@ -241,6 +247,12 @@ class PlatformRuntime:
     def mark_outbox_delivered(self, context: TenantContext, outbox_id: str) -> None:
         with self.store.transaction(context) as tx:
             tx.mark_outbox_delivered(outbox_id)
+
+    def requeue_outbox(self, context: TenantContext, outbox_id: str) -> None:
+        """Return a non-delivered event to the durable dispatcher queue."""
+
+        with self.store.transaction(context) as tx:
+            tx.requeue_outbox(outbox_id)
 
 
 __all__ = ["InMemoryMessageBus", "PlatformRuntime"]

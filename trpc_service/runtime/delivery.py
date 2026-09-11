@@ -71,6 +71,11 @@ class InMemoryDeliveryLedger:
                 latest = attempts[-1]
                 if latest.status == "accepted":
                     return latest
+                if capability == "queryable":
+                    # A queryable provider must be reconciled through its query
+                    # API; never turn an old unknown/failed request into a new
+                    # send attempt merely because a Stream message was replayed.
+                    return latest
                 if latest.status in {"unknown", "manual_review"} and capability == "non_retriable":
                     return latest
                 if latest.request_hash != request_hash:
@@ -146,7 +151,7 @@ class InMemoryDeliveryLedger:
                 status: DeliveryStatus = "accepted"
             elif action == "failed":
                 status = "failed"
-            elif action == "retry" and current.capability != "non_retriable":
+            elif action == "retry" and current.capability in {"idempotent", "queryable"}:
                 # The dispatcher must query/retry later; this endpoint never
                 # invokes a provider inline and never retries ambiguous effects.
                 status = "reconciling"
@@ -172,8 +177,8 @@ class PostgresDeliveryLedger:
     otherwise racy first attempt.
     """
 
-    def __init__(self, database_url: str) -> None:
-        self._connections = PostgresConnections(database_url)
+    def __init__(self, database_url: str, database_role: str | None = None) -> None:
+        self._connections = PostgresConnections(database_url, database_role)
 
     @staticmethod
     def delivery_id(tenant_id: str, outbox_id: str) -> str:
@@ -228,6 +233,8 @@ class PostgresDeliveryLedger:
             if latest is not None:
                 prior = self._attempt(latest)
                 if prior.status == "accepted":
+                    return prior
+                if capability == "queryable":
                     return prior
                 if prior.status in {"unknown", "manual_review"} and capability == "non_retriable":
                     return prior
@@ -340,7 +347,7 @@ class PostgresDeliveryLedger:
                 final_status: DeliveryStatus = "accepted"
             elif action == "failed":
                 final_status = "failed"
-            elif action == "retry" and existing.capability != "non_retriable":
+            elif action == "retry" and existing.capability in {"idempotent", "queryable"}:
                 final_status = "reconciling"
             else:
                 final_status = "manual_review"

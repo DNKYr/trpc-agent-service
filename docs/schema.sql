@@ -363,7 +363,6 @@ CREATE TABLE outbox (
     delivered_at       timestamptz,
     PRIMARY KEY (tenant_id, outbox_id),
     UNIQUE (tenant_id, idempotency_key),
-    UNIQUE (tenant_id, aggregate_type, aggregate_id, event_type),
     FOREIGN KEY (tenant_id, inbox_id) REFERENCES inbox(tenant_id, inbox_id),
     CHECK (
         (

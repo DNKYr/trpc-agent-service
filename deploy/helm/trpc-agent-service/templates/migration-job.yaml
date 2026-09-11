@@ -29,7 +29,12 @@ spec:
           args: ["python", "-m", "trpc_service._cli", "migrate"]
           envFrom:
             - configMapRef: {name: {{ include "trpc-agent-service.fullname" . }}}
-            - secretRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}}
+          env:
+            - name: TRPC_SERVICE_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}, key: {{ .Values.secrets.keys.migratorDatabaseUrl }}}
+            - name: TRPC_SERVICE_DATABASE_ROLE
+              value: platform_schema_owner
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

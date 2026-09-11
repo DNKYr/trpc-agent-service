@@ -32,6 +32,12 @@ class RedisStreamMessageBus:
             },
         )
 
+    def check(self) -> None:
+        """Verify the live Redis dependency without creating a Stream entry."""
+
+        if not self._redis.ping():
+            raise RuntimeError("Redis health check returned false")
+
     def ensure_group(self, group: str) -> None:
         try:
             self._redis.xgroup_create(self._stream, group, id="0", mkstream=True)

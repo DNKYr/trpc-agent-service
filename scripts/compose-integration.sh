@@ -16,10 +16,12 @@ tenant_id="compose-${suffix}"
 webhook_key="compose-${suffix}-webhook-key"
 request_id="compose-${suffix}"
 
-admin_headers=(-H "content-type: application/json")
-if [[ -n "$admin_key" ]]; then
-  admin_headers+=(-H "x-admin-key: $admin_key")
+if [[ -z "$admin_key" ]]; then
+  echo "TRPC_COMPOSE_ADMIN_API_KEY is required; the API fails closed by design" >&2
+  exit 2
 fi
+
+admin_headers=(-H "content-type: application/json" -H "x-admin-key: $admin_key")
 
 wait_for_api() {
   local attempt
@@ -66,6 +68,7 @@ grep -q '"duplicate":false' <<<"$callback" || {
 
 for attempt in $(seq 1 90); do
   operation="$(curl --fail --silent --show-error \
+    "${admin_headers[@]}" \
     "$api_url/v1/operations/$request_id?tenant_id=$tenant_id")"
   if grep -q '"status":"delivered"' <<<"$operation"; then
     printf 'compose integration succeeded for tenant=%s request_id=%s\n' "$tenant_id" "$request_id"

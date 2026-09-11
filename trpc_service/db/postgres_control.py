@@ -49,8 +49,8 @@ def _json(value: Any) -> Any:
 class PostgresControlPlane:
     """Durable control state shared by API, worker, and dispatcher processes."""
 
-    def __init__(self, database_url: str) -> None:
-        self._connections = PostgresConnections(database_url)
+    def __init__(self, database_url: str, database_role: str | None = None) -> None:
+        self._connections = PostgresConnections(database_url, database_role)
 
     @staticmethod
     def _tenant(row: dict[str, Any]) -> Tenant:

@@ -1,40 +1,8 @@
 -- PostgreSQL tenant isolation policy.
--- Run as the deployment administrator after schema.sql. Workload login roles are
--- environment-specific and must only receive one of these NOLOGIN group roles.
-
-DO $roles$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'platform_schema_owner') THEN
-        CREATE ROLE platform_schema_owner NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'platform_migrator') THEN
-        CREATE ROLE platform_migrator NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_gateway') THEN
-        CREATE ROLE agent_gateway NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_worker') THEN
-        CREATE ROLE agent_worker NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_dispatcher') THEN
-        CREATE ROLE agent_dispatcher NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_admin') THEN
-        CREATE ROLE agent_admin NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_auditor') THEN
-        CREATE ROLE agent_auditor NOLOGIN;
-    END IF;
-END
-$roles$;
-
-ALTER ROLE platform_schema_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE platform_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE agent_gateway NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE agent_worker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE agent_dispatcher NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE agent_admin NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE agent_auditor NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+-- Workload groups and login roles are created by
+-- deploy/postgres/init/00-create-workload-roles.sh before this migration runs.
+-- Keeping role administration outside Alembic lets the migrator remain a
+-- non-superuser schema owner.
 
 CREATE SCHEMA IF NOT EXISTS app_security AUTHORIZATION platform_schema_owner;
 ALTER SCHEMA app_security OWNER TO platform_schema_owner;
@@ -214,6 +182,8 @@ GRANT SELECT ON tenant, tenant_runtime_state, storage_route, storage_migration, 
     session, inbox, memory TO agent_dispatcher;
 GRANT SELECT, INSERT, UPDATE ON outbox, memory_projection, delivery_attempt,
     execution_attempt TO agent_dispatcher;
+GRANT SELECT, UPDATE ON budget_reservation TO agent_dispatcher;
+GRANT SELECT, UPDATE (reserved_units, version, updated_at) ON budget_account TO agent_dispatcher;
 GRANT INSERT ON audit_log TO agent_dispatcher;
 
 -- Admin is still tenant scoped. Cross-tenant jobs iterate one SET LOCAL scope at a time.
@@ -228,9 +198,9 @@ GRANT UPDATE (route_status, source_watermark, target_watermark, activated_at)
 GRANT UPDATE (status, target_routing_epoch, source_watermark, target_watermark, error, updated_at)
     ON storage_migration TO agent_admin;
 GRANT SELECT, INSERT ON audit_log TO agent_admin;
+GRANT SELECT, INSERT, UPDATE ON tool_execution, delivery_attempt TO agent_admin;
 
 GRANT SELECT ON audit_log TO agent_auditor;
 
--- Deployment automation may SET ROLE to this NOLOGIN role. It is deliberately not
--- granted to application roles and is still subject to FORCE RLS for data access.
-GRANT platform_schema_owner TO platform_migrator;
+-- The bootstrap role script grants ``platform_schema_owner`` only to the
+-- dedicated migrator login; application workload logins cannot assume it.

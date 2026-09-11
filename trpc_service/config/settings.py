@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Protocol
 
@@ -83,6 +83,32 @@ def _as_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _tenant_api_keys(raw_value: str) -> dict[str, str]:
+    """Parse tenant-scoped HTTP API credentials from a JSON object.
+
+    Keys are tenant identifiers and values are bearer/API-key credentials.  Keeping
+    the mapping in one environment variable makes it usable by container and Helm
+    secret injection without putting a secret in release or tenant metadata.
+    """
+
+    if not raw_value.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("TRPC_SERVICE_TENANT_API_KEYS must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("TRPC_SERVICE_TENANT_API_KEYS must be a JSON object")
+    keys: dict[str, str] = {}
+    for tenant_id, credential in parsed.items():
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant API key mapping contains an invalid tenant identifier")
+        if not isinstance(credential, str) or not credential:
+            raise ValueError("tenant API key mapping contains an empty credential")
+        keys[tenant_id] = credential
+    return keys
+
+
 @dataclass(frozen=True, slots=True)
 class AppSettings:
     """Settings accepted by all platform processes.
@@ -96,15 +122,21 @@ class AppSettings:
     port: int = 8000
     runtime_backend: str = "memory"
     database_url: str = "postgresql+asyncpg://trpc:trpc@localhost:5432/trpc_agent"
+    database_role: str | None = None
     redis_url: str = "redis://localhost:6379/0"
     object_store_endpoint: str = "http://localhost:9000"
     object_store_bucket: str = "trpc-artifacts"
-    object_store_access_key: str | None = None
-    object_store_secret_key: str | None = None
-    admin_api_key: str | None = None
+    object_store_access_key: str | None = field(default=None, repr=False)
+    object_store_secret_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
+    tenant_api_keys: Mapping[str, str] = field(default_factory=dict, repr=False)
+    execution_lease_seconds: int = 60
+    execution_heartbeat_seconds: int = 15
+    model_max_output_tokens: int = 1024
+    model_input_overhead_tokens: int = 256
     worker_id: str = "local-worker"
     dispatcher_id: str = "local-dispatcher"
-    trpc_agent_api_key: str | None = None
+    trpc_agent_api_key: str | None = field(default=None, repr=False)
     trpc_agent_base_url: str = "https://api.openai.com/v1"
     trpc_agent_model_name: str = "gpt-4o-mini"
     mock_model: bool = True
@@ -136,6 +168,7 @@ class AppSettings:
                 "DATABASE_URL",
                 "postgresql+asyncpg://trpc:trpc@localhost:5432/trpc_agent",
             ),
+            database_role=configured("TRPC_SERVICE_DATABASE_ROLE", "TRPC_DATABASE_ROLE") or None,
             redis_url=configured("TRPC_SERVICE_REDIS_URL", "REDIS_URL", "redis://localhost:6379/0"),
             object_store_endpoint=configured(
                 "TRPC_SERVICE_OBJECT_STORE_ENDPOINT",
@@ -154,6 +187,29 @@ class AppSettings:
             )
             or None,
             admin_api_key=configured("TRPC_SERVICE_ADMIN_API_KEY", "TRPC_ADMIN_API_KEY") or None,
+            tenant_api_keys=_tenant_api_keys(
+                configured("TRPC_SERVICE_TENANT_API_KEYS", "TRPC_TENANT_API_KEYS")
+            ),
+            execution_lease_seconds=int(
+                configured("TRPC_SERVICE_EXECUTION_LEASE_SECONDS", "TRPC_EXECUTION_LEASE_SECONDS", "60")
+            ),
+            execution_heartbeat_seconds=int(
+                configured(
+                    "TRPC_SERVICE_EXECUTION_HEARTBEAT_SECONDS",
+                    "TRPC_EXECUTION_HEARTBEAT_SECONDS",
+                    "15",
+                )
+            ),
+            model_max_output_tokens=int(
+                configured("TRPC_SERVICE_MODEL_MAX_OUTPUT_TOKENS", "TRPC_MODEL_MAX_OUTPUT_TOKENS", "1024")
+            ),
+            model_input_overhead_tokens=int(
+                configured(
+                    "TRPC_SERVICE_MODEL_INPUT_OVERHEAD_TOKENS",
+                    "TRPC_MODEL_INPUT_OVERHEAD_TOKENS",
+                    "256",
+                )
+            ),
             worker_id=configured("TRPC_SERVICE_WORKER_ID", "TRPC_WORKER_ID", "local-worker"),
             dispatcher_id=configured(
                 "TRPC_SERVICE_DISPATCHER_ID", "TRPC_DISPATCHER_ID", "local-dispatcher"
@@ -176,6 +232,13 @@ class AppSettings:
         return {
             "environment": self.environment,
             "runtime_backend": self.runtime_backend,
+            "database_role": self.database_role,
+            "execution_lease_seconds": self.execution_lease_seconds,
+            "execution_heartbeat_seconds": self.execution_heartbeat_seconds,
+            "model_max_output_tokens": self.model_max_output_tokens,
+            "model_input_overhead_tokens": self.model_input_overhead_tokens,
+            "admin_api_key": "[REDACTED]" if self.admin_api_key else None,
+            "tenant_api_key_tenants": sorted(self.tenant_api_keys),
             "trpc_agent_api_key": "[REDACTED]" if self.trpc_agent_api_key else None,
             "object_store_secret_key": "[REDACTED]" if self.object_store_secret_key else None,
             "trpc_agent_base_url": self.trpc_agent_base_url,
@@ -185,6 +248,41 @@ class AppSettings:
             "log_level": self.log_level,
             "sensitive_fields": self.sensitive_fields,
         }
+
+    @property
+    def authentication_configured(self) -> bool:
+        """Whether any HTTP principal can be authenticated.
+
+        The web layer deliberately treats a missing configuration as unavailable,
+        rather than allowing an unauthenticated development convenience path.
+        """
+
+        return bool(self.admin_api_key or self.tenant_api_keys)
+
+    def validate_startup(self) -> None:
+        """Reject production processes that would expose an unauthenticated API."""
+
+        if self.execution_lease_seconds < 2:
+            raise RuntimeError("TRPC_SERVICE_EXECUTION_LEASE_SECONDS must be at least 2")
+        if not 0 < self.execution_heartbeat_seconds < self.execution_lease_seconds:
+            raise RuntimeError(
+                "TRPC_SERVICE_EXECUTION_HEARTBEAT_SECONDS must be positive and shorter than the lease"
+            )
+        if self.model_max_output_tokens < 1 or self.model_input_overhead_tokens < 0:
+            raise RuntimeError("model token reservation bounds are invalid")
+
+        if self.environment.strip().lower() in {"production", "prod"} and not self.admin_api_key:
+            raise RuntimeError(
+                "TRPC_SERVICE_ADMIN_API_KEY is required when TRPC_SERVICE_ENVIRONMENT=production"
+            )
+        if (
+            self.environment.strip().lower() in {"production", "prod"}
+            and self.runtime_backend == "postgres"
+            and not self.database_role
+        ):
+            raise RuntimeError(
+                "TRPC_SERVICE_DATABASE_ROLE is required for a production PostgreSQL process"
+            )
 
 
 # Compatibility names retained for the API and runtime modules.  New integration code
