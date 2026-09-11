@@ -48,6 +48,14 @@ config:
   logLevel: INFO
   otlpEndpoint: ""
 
+# The worker materializes tenant-scoped retrieval profiles here.  For the
+# default PostgreSQL runtime this must be a durable ReadWriteMany PVC because
+# multiple workers can project and query the active profile.  The chart fails
+# closed when it is omitted in postgres mode.
+storageProfiles:
+  existingPvc: ""
+  mountPath: /var/lib/trpc-storage
+
 api:
   replicas: 2
   service:
