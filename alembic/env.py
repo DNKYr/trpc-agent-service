@@ -34,6 +34,11 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         if database_role is not None:
             connection.exec_driver_sql(f"SET ROLE {database_role}")
+            # ``SET ROLE`` starts SQLAlchemy's implicit transaction.  Commit
+            # that boundary before Alembic creates its own migration
+            # transaction; otherwise all DDL and the version-table update are
+            # rolled back when this connection closes.
+            connection.commit()
         context.configure(connection=connection)
         with context.begin_transaction():
             context.run_migrations()
