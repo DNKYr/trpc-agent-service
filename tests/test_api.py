@@ -6,7 +6,9 @@ import httpx
 import pytest
 
 from trpc_service.config import AppSettings
+from trpc_service.runtime import InboundEnvelope, TenantContext
 from trpc_service.web.app import ServiceContainer, create_app
+from trpc_service.web.schemas import TenantCreate
 
 
 def test_admin_callback_and_direct_run_share_the_durable_runtime() -> None:
@@ -193,3 +195,107 @@ def test_non_http_production_process_requires_restricted_database_role() -> None
         runtime_backend="postgres",
         database_role="agent_worker",
     ).validate_startup(require_http_auth=False)
+
+
+def test_accepted_inbox_keeps_its_pinned_release_after_activation_changes() -> None:
+    async def scenario() -> None:
+        services = ServiceContainer(AppSettings(admin_api_key="admin-test-key"))
+        app = create_app(services)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://platform.test",
+            headers={"x-admin-key": "admin-test-key"},
+        ) as client:
+            assert (
+                await client.post(
+                    "/admin/v1/tenants", json={"tenant_id": "tenant-pinned", "display_name": "Pinned"}
+                )
+            ).status_code == 201
+            assert (
+                await client.post(
+                    "/admin/v1/tenants/tenant-pinned/agents",
+                    json={"agent_id": "support", "name": "Support"},
+                )
+            ).status_code == 201
+            for version in (1, 2):
+                assert (
+                    await client.post(
+                        "/admin/v1/tenants/tenant-pinned/agents/support/releases",
+                        json={"version": version, "model_config": {"mode": "mock"}},
+                    )
+                ).status_code == 201
+            assert (
+                await client.post(
+                    "/admin/v1/tenants/tenant-pinned/agents/support/releases/1/activate"
+                )
+            ).status_code == 200
+            assert (
+                await client.post(
+                    "/admin/v1/tenants/tenant-pinned/channels",
+                    json={
+                        "binding_id": "mock-pinned",
+                        "agent_id": "support",
+                        "provider": "mock",
+                        "external_account_id": "pinned-account",
+                        "webhook_key": "pinned-webhook-key-123456",
+                        "capabilities": {"callback_secret": "pinned-secret"},
+                    },
+                )
+            ).status_code == 201
+            accepted = await client.post(
+                "/callbacks/mock/pinned-webhook-key-123456",
+                headers={"x-mock-secret": "pinned-secret"},
+                json={"message_id": "pinned-message", "user_id": "alice", "text": "hello"},
+            )
+            assert accepted.status_code == 200
+            # This moves only the mutable active pointer. The accepted Inbox
+            # must continue to execute the release version it recorded above.
+            assert (
+                await client.post(
+                    "/admin/v1/tenants/tenant-pinned/agents/support/releases/2/activate"
+                )
+            ).status_code == 200
+            services.dispatch("tenant-pinned")
+            await services.process_published("tenant-pinned")
+
+        snapshot = services.runtime.snapshot(TenantContext("tenant-pinned"))
+        started = next(row for row in snapshot["events"] if row["event_type"] == "runner.started")
+        assert started["payload"]["release_version"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_worker_heartbeat_renews_a_live_execution_lease() -> None:
+    async def scenario() -> None:
+        services = ServiceContainer(
+            AppSettings(
+                admin_api_key="admin-test-key",
+                execution_lease_seconds=2,
+                execution_heartbeat_seconds=1,
+            )
+        )
+        services.create_tenant(TenantCreate(tenant_id="tenant-heartbeat", display_name="Heartbeat"))
+        context = TenantContext("tenant-heartbeat", request_id="heartbeat", trace_id="a" * 32)
+        inbox = services.runtime.accept_inbound(
+            context,
+            InboundEnvelope(
+                tenant_id="tenant-heartbeat",
+                channel_binding_id="test-binding",
+                agent_id="test-agent",
+                session_id="test-session",
+                idempotency_key="heartbeat-message",
+                external_message_id="heartbeat-message",
+                payload={"text": "heartbeat"},
+                config_version=1,
+            ),
+        ).inbox
+        claim = services.runtime.claim_execution(
+            context, inbox.inbox_id, "worker-heartbeat", lease_seconds=2
+        )
+        _, renewed = await services._run_with_execution_heartbeat(
+            context, claim, asyncio.sleep(1.05, result="done")
+        )
+        assert renewed.lease_expires_at > claim.lease_expires_at
+
+    asyncio.run(scenario())
