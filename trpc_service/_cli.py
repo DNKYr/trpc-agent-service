@@ -193,12 +193,16 @@ async def _demo_async(services: ServiceContainer) -> dict[str, Any]:
 
 
 def command_seed(_: argparse.Namespace) -> int:
-    _dump(_seed(ServiceContainer(AppSettings.from_env())))
+    settings = AppSettings.from_env()
+    settings.validate_startup(require_http_auth=False)
+    _dump(_seed(ServiceContainer(settings)))
     return 0
 
 
 def command_demo(_: argparse.Namespace) -> int:
-    _dump(asyncio.run(_demo_async(ServiceContainer(AppSettings.from_env()))))
+    settings = AppSettings.from_env()
+    settings.validate_startup(require_http_auth=False)
+    _dump(asyncio.run(_demo_async(ServiceContainer(settings))))
     return 0
 
 
@@ -218,7 +222,9 @@ def command_api(_: argparse.Namespace) -> int:
 def command_dispatcher(args: argparse.Namespace) -> int:
     # In a multi-process deployment this command uses the shared SQL/Redis adapters.
     # Memory mode is still useful as a deterministic one-shot health check.
-    services = ServiceContainer(AppSettings.from_env())
+    settings = AppSettings.from_env()
+    settings.validate_startup(require_http_auth=False)
+    services = ServiceContainer(settings)
     if services.settings.runtime_backend == "memory":
         _seed(services)
     while True:
@@ -235,7 +241,9 @@ def command_dispatcher(args: argparse.Namespace) -> int:
 
 
 def command_worker(args: argparse.Namespace) -> int:
-    services = ServiceContainer(AppSettings.from_env())
+    settings = AppSettings.from_env()
+    settings.validate_startup(require_http_auth=False)
+    services = ServiceContainer(settings)
     if services.settings.runtime_backend == "memory":
         _seed(services)
     while True:
@@ -255,7 +263,9 @@ def command_worker(args: argparse.Namespace) -> int:
 async def _run_wecom_aibot_gateway(args: argparse.Namespace) -> int:
     """Own Smart Bot WebSockets and their separate durable reply consumer group."""
 
-    services = ServiceContainer(AppSettings.from_env())
+    settings = AppSettings.from_env()
+    settings.validate_startup(require_http_auth=False)
+    services = ServiceContainer(settings)
     supervisor = services.aibot_supervisor()
     await supervisor.start()
     try:
@@ -285,6 +295,7 @@ def command_migrate(_: argparse.Namespace) -> int:
 
     from alembic import command
 
+    AppSettings.from_env().validate_startup(require_http_auth=False)
     command.upgrade(Config("alembic.ini"), "head")
     return 0
 

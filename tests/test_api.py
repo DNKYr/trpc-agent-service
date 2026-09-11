@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
 from trpc_service.config import AppSettings
 from trpc_service.web.app import ServiceContainer, create_app
@@ -176,3 +177,19 @@ def test_production_app_requires_an_admin_authentication_configuration() -> None
         assert "TRPC_SERVICE_ADMIN_API_KEY" in str(exc)
     else:  # pragma: no cover - keeps the assertion clear if startup validation regresses.
         raise AssertionError("production startup accepted an unconfigured admin API")
+
+
+def test_non_http_production_process_requires_restricted_database_role() -> None:
+    settings = AppSettings(
+        environment="production",
+        runtime_backend="postgres",
+        database_role=None,
+    )
+    with pytest.raises(RuntimeError, match="DATABASE_ROLE"):
+        settings.validate_startup(require_http_auth=False)
+
+    AppSettings(
+        environment="production",
+        runtime_backend="postgres",
+        database_role="agent_worker",
+    ).validate_startup(require_http_auth=False)

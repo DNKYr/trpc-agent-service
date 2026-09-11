@@ -265,8 +265,14 @@ class AppSettings:
 
         return bool(self.admin_api_key or self.tenant_api_keys)
 
-    def validate_startup(self) -> None:
-        """Reject production processes that would expose an unauthenticated API."""
+    def validate_startup(self, *, require_http_auth: bool = True) -> None:
+        """Reject unsafe production process configuration before work starts.
+
+        Every PostgreSQL workload needs a restricted effective role.  Only the
+        HTTP API needs an administrator credential, so workers and migration
+        jobs can validate the shared database invariant without being given an
+        unrelated API secret.
+        """
 
         if self.execution_lease_seconds < 2:
             raise RuntimeError("TRPC_SERVICE_EXECUTION_LEASE_SECONDS must be at least 2")
@@ -277,7 +283,11 @@ class AppSettings:
         if self.model_max_output_tokens < 1 or self.model_input_overhead_tokens < 0:
             raise RuntimeError("model token reservation bounds are invalid")
 
-        if self.environment.strip().lower() in {"production", "prod"} and not self.admin_api_key:
+        if (
+            require_http_auth
+            and self.environment.strip().lower() in {"production", "prod"}
+            and not self.admin_api_key
+        ):
             raise RuntimeError(
                 "TRPC_SERVICE_ADMIN_API_KEY is required when TRPC_SERVICE_ENVIRONMENT=production"
             )
