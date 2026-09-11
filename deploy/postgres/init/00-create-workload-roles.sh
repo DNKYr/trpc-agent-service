@@ -44,15 +44,21 @@ BEGIN
 END
 $roles$;
 
--- A legacy Compose deployment created its tables as the ``trpc`` bootstrap
--- superuser.  A NOINHERIT migrator that SET ROLEs to platform_schema_owner
--- cannot even read alembic_version until ownership is moved.  This is an
--- ownership-only transition: it neither copies nor deletes tenant data.  It
--- is conditional so a fresh cluster (whose bootstrap role may be postgres)
--- remains idempotent.
-SELECT format('REASSIGN OWNED BY %I TO platform_schema_owner', :'bootstrap_role')
-WHERE :'bootstrap_role' <> 'platform_schema_owner'
-  AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'bootstrap_role')
+-- Alembic creates its metadata table before executing the RLS SQL, so a
+-- legacy Compose database leaves this one table owned by the old bootstrap
+-- role even though the application tables are already transferred by
+-- docs/rls.sql.  Transfer only that known metadata relation.  This is an
+-- ownership-only transition: it neither copies nor deletes tenant data, and
+-- is a no-op on a freshly initialized cluster.
+SELECT 'ALTER TABLE public.alembic_version OWNER TO platform_schema_owner'
+WHERE to_regclass('public.alembic_version') IS NOT NULL
+  AND EXISTS (
+      SELECT 1
+      FROM pg_class relation
+      JOIN pg_roles owner_role ON owner_role.oid = relation.relowner
+      WHERE relation.oid = 'public.alembic_version'::regclass
+        AND owner_role.rolname = :'bootstrap_role'
+  )
 \gexec
 
 GRANT agent_admin, agent_gateway TO agent_api_gateway;
