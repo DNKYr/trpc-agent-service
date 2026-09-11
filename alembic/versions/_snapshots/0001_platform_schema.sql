@@ -498,12 +498,6 @@ CREATE TABLE delivery_attempt (
     trace_id           text NOT NULL,
     started_at         timestamptz NOT NULL DEFAULT now(),
     finished_at        timestamptz,
-    -- A reply call may outlive a Redis consumer claim. Ownership is recorded
-    -- here so a reclaimed Stream message cannot create a second provider call
-    -- while the first is still within its delivery lease.
-    lease_owner        text,
-    lease_fence        bigint NOT NULL DEFAULT 0,
-    lease_expires_at   timestamptz,
     PRIMARY KEY (tenant_id, delivery_id, attempt_no),
     FOREIGN KEY (tenant_id, outbox_id) REFERENCES outbox(tenant_id, outbox_id),
     FOREIGN KEY (tenant_id, session_id) REFERENCES session(tenant_id, session_id),
@@ -513,10 +507,6 @@ CREATE TABLE delivery_attempt (
         OR retry_capability <> 'idempotent'
     )
 );
-
-CREATE INDEX delivery_attempt_lease_idx
-    ON delivery_attempt (tenant_id, status, lease_expires_at)
-    WHERE status IN ('sending', 'reconciling');
 
 CREATE TABLE audit_log (
     tenant_id          text NOT NULL REFERENCES tenant(tenant_id),

@@ -1,9 +1,9 @@
 """SQLAlchemy 2 mappings for the PostgreSQL reference schema.
 
-The Alembic migration executes ``docs/schema.sql`` because it carries a few
-PostgreSQL-only details (partitioning and deferrable cyclic constraints).  These
-mappings are deliberately complete enough for repositories and local SQLite
-adapter tests; PostgreSQL remains the authoritative production schema.
+Alembic executes revision-owned immutable SQL snapshots because they carry a
+few PostgreSQL-only details (partitioning and deferrable cyclic constraints).
+These mappings are deliberately complete enough for repositories and local
+SQLite adapter tests; PostgreSQL remains the authoritative production schema.
 """
 
 from __future__ import annotations
@@ -679,6 +679,9 @@ class DeliveryAttempt(Base):
     trace_id: Mapped[str] = mapped_column(Text, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(Text)
+    lease_fence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         ForeignKeyConstraint(["tenant_id", "outbox_id"], ["outbox.tenant_id", "outbox.outbox_id"]),
@@ -697,6 +700,13 @@ class DeliveryAttempt(Base):
         CheckConstraint(
             "status IN ('prepared', 'sending', 'accepted', 'failed', 'unknown', 'reconciling', 'manual_review')",
             name="delivery_status_ck",
+        ),
+        Index(
+            "delivery_attempt_lease_idx",
+            "tenant_id",
+            "status",
+            "lease_expires_at",
+            postgresql_where=text("status IN ('sending', 'reconciling')"),
         ),
     )
 

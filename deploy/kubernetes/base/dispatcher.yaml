@@ -23,8 +23,15 @@ spec:
           args: [python, -m, trpc_service._cli, dispatcher, --no-once]
           envFrom:
             - configMapRef: {name: trpc-agent-service}
-            - secretRef: {name: trpc-agent-service-secrets}
           env:
+            - name: TRPC_SERVICE_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_SERVICE_DISPATCHER_DATABASE_URL}
+            - name: TRPC_SERVICE_DATABASE_ROLE
+              value: agent_dispatcher
+            - name: TRPC_SERVICE_REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_SERVICE_REDIS_URL}
             - name: TRPC_SERVICE_DISPATCHER_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
           securityContext:

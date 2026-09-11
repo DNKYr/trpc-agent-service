@@ -133,6 +133,7 @@ class AppSettings:
     tenant_api_keys: Mapping[str, str] = field(default_factory=dict, repr=False)
     execution_lease_seconds: int = 60
     execution_heartbeat_seconds: int = 15
+    delivery_attempt_lease_seconds: int = 90
     model_max_output_tokens: int = 1024
     model_input_overhead_tokens: int = 256
     worker_id: str = "local-worker"
@@ -206,6 +207,13 @@ class AppSettings:
                     "15",
                 )
             ),
+            delivery_attempt_lease_seconds=int(
+                configured(
+                    "TRPC_SERVICE_DELIVERY_ATTEMPT_LEASE_SECONDS",
+                    "TRPC_DELIVERY_ATTEMPT_LEASE_SECONDS",
+                    "90",
+                )
+            ),
             model_max_output_tokens=int(
                 configured("TRPC_SERVICE_MODEL_MAX_OUTPUT_TOKENS", "TRPC_MODEL_MAX_OUTPUT_TOKENS", "1024")
             ),
@@ -241,6 +249,7 @@ class AppSettings:
             "database_role": self.database_role,
             "execution_lease_seconds": self.execution_lease_seconds,
             "execution_heartbeat_seconds": self.execution_heartbeat_seconds,
+            "delivery_attempt_lease_seconds": self.delivery_attempt_lease_seconds,
             "model_max_output_tokens": self.model_max_output_tokens,
             "model_input_overhead_tokens": self.model_input_overhead_tokens,
             "admin_api_key": "[REDACTED]" if self.admin_api_key else None,
@@ -280,6 +289,8 @@ class AppSettings:
             raise RuntimeError(
                 "TRPC_SERVICE_EXECUTION_HEARTBEAT_SECONDS must be positive and shorter than the lease"
             )
+        if self.delivery_attempt_lease_seconds < 1:
+            raise RuntimeError("TRPC_SERVICE_DELIVERY_ATTEMPT_LEASE_SECONDS must be positive")
         if self.model_max_output_tokens < 1 or self.model_input_overhead_tokens < 0:
             raise RuntimeError("model token reservation bounds are invalid")
 

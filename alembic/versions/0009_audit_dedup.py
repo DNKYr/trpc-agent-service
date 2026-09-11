@@ -13,7 +13,7 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        CREATE TABLE audit_dedup (
+        CREATE TABLE IF NOT EXISTS audit_dedup (
             tenant_id text NOT NULL REFERENCES tenant(tenant_id),
             audit_id text NOT NULL,
             created_at timestamptz NOT NULL DEFAULT now(),
@@ -21,11 +21,15 @@ def upgrade() -> None:
         )
         """
     )
+    # The immutable initial-schema snapshot used by fresh deployments already
+    # contains this table. These statements keep older upgrades correct while
+    # remaining safe for a clean database.
     op.execute("ALTER TABLE audit_dedup OWNER TO platform_schema_owner")
     op.execute("ALTER TABLE audit_dedup ENABLE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE audit_dedup FORCE ROW LEVEL SECURITY")
     op.execute(
         """
+        DROP POLICY IF EXISTS tenant_isolation ON audit_dedup;
         CREATE POLICY tenant_isolation ON audit_dedup
         USING (tenant_id = app_security.current_tenant_id())
         WITH CHECK (tenant_id = app_security.current_tenant_id())
@@ -36,4 +40,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP TABLE audit_dedup")
+    op.execute("DROP TABLE IF EXISTS audit_dedup")

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from threading import RLock
 from typing import Any, Literal
@@ -35,6 +36,11 @@ class DeliveryAttempt:
     trace_id: str = ""
     started_at: datetime = datetime.min.replace(tzinfo=UTC)
     finished_at: datetime | None = None
+    lease_owner: str | None = None
+    lease_fence: int = 0
+    lease_expires_at: datetime | None = None
+    # Ephemeral result of ``begin``; it is deliberately not stored in SQL.
+    lease_acquired: bool = False
 
 
 class InMemoryDeliveryLedger:
@@ -45,9 +51,18 @@ class InMemoryDeliveryLedger:
     and ambiguous non-retriable delivery requires a human decision.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        now: Callable[[], datetime] | None = None,
+        default_lease_seconds: int = 90,
+    ) -> None:
+        if default_lease_seconds < 1:
+            raise ValueError("delivery attempt lease must be positive")
         self._lock = RLock()
         self._attempts: dict[tuple[str, str], list[DeliveryAttempt]] = {}
+        self._now = now or (lambda: datetime.now(UTC))
+        self._default_lease_seconds = default_lease_seconds
 
     @staticmethod
     def delivery_id(tenant_id: str, outbox_id: str) -> str:
@@ -63,23 +78,86 @@ class InMemoryDeliveryLedger:
         capability: DeliveryCapability,
         request_hash: str,
         trace_id: str,
+        owner: str = "dispatcher",
+        lease_seconds: int | None = None,
     ) -> DeliveryAttempt:
+        if not owner:
+            raise ValueError("delivery attempt owner is required")
+        lease_seconds = lease_seconds or self._default_lease_seconds
+        if lease_seconds < 1:
+            raise ValueError("delivery attempt lease must be positive")
         with self._lock:
             delivery_id = self.delivery_id(tenant_id, outbox_id)
             attempts = self._attempts.setdefault((tenant_id, delivery_id), [])
+            now = self._now()
+            expiry = now + timedelta(seconds=lease_seconds)
             if attempts:
                 latest = attempts[-1]
                 if latest.status == "accepted":
                     return latest
-                if capability == "queryable":
-                    # A queryable provider must be reconciled through its query
-                    # API; never turn an old unknown/failed request into a new
-                    # send attempt merely because a Stream message was replayed.
-                    return latest
-                if latest.status in {"unknown", "manual_review"} and capability == "non_retriable":
-                    return latest
                 if latest.request_hash != request_hash:
                     raise ValueError("delivery request changed for deterministic outbox delivery")
+                active = (
+                    latest.status in {"sending", "reconciling"}
+                    and latest.lease_expires_at is not None
+                    and latest.lease_expires_at > now
+                )
+                if active:
+                    # A reclaimed Redis entry does not grant ownership of an
+                    # already-running provider call. Keep it pending until the
+                    # SQL delivery lease expires.
+                    return latest
+                if latest.status in {"sending", "reconciling"}:
+                    if capability == "non_retriable":
+                        latest = replace(
+                            latest,
+                            status="manual_review",
+                            error_code="delivery_attempt_lease_expired",
+                            finished_at=now,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                        )
+                        attempts[-1] = latest
+                        return latest
+                    if capability == "queryable":
+                        latest = replace(
+                            latest,
+                            status="reconciling",
+                            error_code="delivery_attempt_lease_expired",
+                            lease_owner=owner,
+                            lease_fence=latest.lease_fence + 1,
+                            lease_expires_at=expiry,
+                        )
+                        attempts[-1] = latest
+                        return replace(latest, lease_acquired=True)
+                    # A provider has a deterministic idempotency key. Record
+                    # the abandoned attempt and issue a new leased attempt
+                    # with the same key below.
+                    attempts[-1] = replace(
+                        latest,
+                        status="failed",
+                        error_code="delivery_attempt_lease_expired",
+                        finished_at=now,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                    )
+                elif capability == "non_retriable" and latest.status in {
+                    "unknown",
+                    "manual_review",
+                }:
+                    return latest
+                elif capability == "queryable":
+                    # Failed/unknown queryable operations are recovered only
+                    # through their provider query operation, never a resend.
+                    latest = replace(
+                        latest,
+                        status="reconciling",
+                        lease_owner=owner,
+                        lease_fence=latest.lease_fence + 1,
+                        lease_expires_at=expiry,
+                    )
+                    attempts[-1] = latest
+                    return replace(latest, lease_acquired=True)
             attempt = DeliveryAttempt(
                 tenant_id=tenant_id,
                 delivery_id=delivery_id,
@@ -92,10 +170,13 @@ class InMemoryDeliveryLedger:
                 status="sending",
                 provider_idempotency_key=delivery_id if capability == "idempotent" else None,
                 trace_id=trace_id,
-                started_at=datetime.now(UTC),
+                started_at=now,
+                lease_owner=owner,
+                lease_fence=1,
+                lease_expires_at=expiry,
             )
             attempts.append(attempt)
-            return attempt
+            return replace(attempt, lease_acquired=True)
 
     def finish(
         self,
@@ -112,6 +193,15 @@ class InMemoryDeliveryLedger:
             current = attempts[attempt.attempt_no - 1]
             if current.status == "accepted":
                 return current
+            if (
+                current.status not in {"sending", "reconciling"}
+                or current.lease_owner != attempt.lease_owner
+                or current.lease_fence != attempt.lease_fence
+            ):
+                # A later dispatcher recovered this attempt. The original
+                # caller may report its result for observability, but cannot
+                # overwrite the new owner's recovery decision.
+                return current
             final_status: DeliveryStatus = status
             if status == "unknown" and current.capability == "non_retriable":
                 final_status = "manual_review"
@@ -120,7 +210,9 @@ class InMemoryDeliveryLedger:
                 status=final_status,
                 provider_message_id=provider_message_id,
                 error_code=error_code,
-                finished_at=datetime.now(UTC),
+                finished_at=self._now(),
+                lease_owner=None,
+                lease_expires_at=None,
             )
             attempts[attempt.attempt_no - 1] = final
             return final
@@ -161,7 +253,9 @@ class InMemoryDeliveryLedger:
                 current,
                 status=status,
                 error_code=note or current.error_code,
-                finished_at=datetime.now(UTC),
+                finished_at=self._now(),
+                lease_owner=None,
+                lease_expires_at=None,
             )
             attempts[-1] = final
             return final
@@ -177,8 +271,17 @@ class PostgresDeliveryLedger:
     otherwise racy first attempt.
     """
 
-    def __init__(self, database_url: str, database_role: str | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        database_role: str | None = None,
+        *,
+        default_lease_seconds: int = 90,
+    ) -> None:
+        if default_lease_seconds < 1:
+            raise ValueError("delivery attempt lease must be positive")
         self._connections = PostgresConnections(database_url, database_role)
+        self._default_lease_seconds = default_lease_seconds
 
     @staticmethod
     def delivery_id(tenant_id: str, outbox_id: str) -> str:
@@ -202,6 +305,9 @@ class PostgresDeliveryLedger:
             trace_id=str(row["trace_id"]),
             started_at=row["started_at"],
             finished_at=row["finished_at"],
+            lease_owner=row["lease_owner"],
+            lease_fence=int(row["lease_fence"]),
+            lease_expires_at=row["lease_expires_at"],
         )
 
     def begin(
@@ -214,9 +320,18 @@ class PostgresDeliveryLedger:
         capability: DeliveryCapability,
         request_hash: str,
         trace_id: str,
+        owner: str = "dispatcher",
+        lease_seconds: int | None = None,
     ) -> DeliveryAttempt:
+        if not owner:
+            raise ValueError("delivery attempt owner is required")
+        lease_seconds = lease_seconds or self._default_lease_seconds
+        if lease_seconds < 1:
+            raise ValueError("delivery attempt lease must be positive")
         context = TenantContext(tenant_id, actor_id="dispatcher", trace_id=trace_id)
         delivery_id = self.delivery_id(tenant_id, outbox_id)
+        now = datetime.now(UTC)
+        expiry = now + timedelta(seconds=lease_seconds)
         with self._connections.tenant(context) as connection:
             connection.execute(
                 "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(%s, 0))",
@@ -234,12 +349,66 @@ class PostgresDeliveryLedger:
                 prior = self._attempt(latest)
                 if prior.status == "accepted":
                     return prior
-                if capability == "queryable":
-                    return prior
-                if prior.status in {"unknown", "manual_review"} and capability == "non_retriable":
-                    return prior
                 if prior.request_hash != request_hash:
                     raise ValueError("delivery request changed for deterministic outbox delivery")
+                active = (
+                    prior.status in {"sending", "reconciling"}
+                    and prior.lease_expires_at is not None
+                    and prior.lease_expires_at > now
+                )
+                if active:
+                    return prior
+                if prior.status in {"sending", "reconciling"}:
+                    if capability == "non_retriable":
+                        row = connection.execute(
+                            """
+                            UPDATE delivery_attempt
+                            SET status = 'manual_review', last_error_code = 'delivery_attempt_lease_expired',
+                                finished_at = now(), lease_owner = NULL, lease_expires_at = NULL
+                            WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
+                            RETURNING *
+                            """,
+                            (tenant_id, delivery_id, prior.attempt_no),
+                        ).fetchone()
+                        return self._attempt(row)
+                    if capability == "queryable":
+                        row = connection.execute(
+                            """
+                            UPDATE delivery_attempt
+                            SET status = 'reconciling', last_error_code = 'delivery_attempt_lease_expired',
+                                lease_owner = %s, lease_fence = lease_fence + 1, lease_expires_at = %s
+                            WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
+                            RETURNING *
+                            """,
+                            (owner, expiry, tenant_id, delivery_id, prior.attempt_no),
+                        ).fetchone()
+                        return replace(self._attempt(row), lease_acquired=True)
+                    connection.execute(
+                        """
+                        UPDATE delivery_attempt
+                        SET status = 'failed', last_error_code = 'delivery_attempt_lease_expired',
+                            finished_at = now(), lease_owner = NULL, lease_expires_at = NULL
+                        WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
+                        """,
+                        (tenant_id, delivery_id, prior.attempt_no),
+                    )
+                elif capability == "non_retriable" and prior.status in {
+                    "unknown",
+                    "manual_review",
+                }:
+                    return prior
+                elif capability == "queryable":
+                    row = connection.execute(
+                        """
+                        UPDATE delivery_attempt
+                        SET status = 'reconciling', lease_owner = %s,
+                            lease_fence = lease_fence + 1, lease_expires_at = %s
+                        WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
+                        RETURNING *
+                        """,
+                        (owner, expiry, tenant_id, delivery_id, prior.attempt_no),
+                    ).fetchone()
+                    return replace(self._attempt(row), lease_acquired=True)
                 attempt_no = prior.attempt_no + 1
             else:
                 attempt_no = 1
@@ -248,8 +417,8 @@ class PostgresDeliveryLedger:
                 INSERT INTO delivery_attempt (
                     tenant_id, delivery_id, attempt_no, outbox_id, session_id,
                     channel_binding_id, retry_capability, provider_idempotency_key,
-                    request_hash, status, trace_id, started_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'sending', %s, now())
+                    request_hash, status, trace_id, started_at, lease_owner, lease_fence, lease_expires_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'sending', %s, now(), %s, 1, %s)
                 RETURNING *
                 """,
                 (
@@ -263,9 +432,11 @@ class PostgresDeliveryLedger:
                     delivery_id if capability == "idempotent" else None,
                     request_hash,
                     trace_id,
+                    owner,
+                    expiry,
                 ),
             ).fetchone()
-            return self._attempt(row)
+            return replace(self._attempt(row), lease_acquired=True)
 
     def finish(
         self,
@@ -291,14 +462,22 @@ class PostgresDeliveryLedger:
             existing = self._attempt(current)
             if existing.status == "accepted":
                 return existing
+            if (
+                existing.status not in {"sending", "reconciling"}
+                or existing.lease_owner != attempt.lease_owner
+                or existing.lease_fence != attempt.lease_fence
+            ):
+                return existing
             final_status: DeliveryStatus = status
             if status == "unknown" and existing.capability == "non_retriable":
                 final_status = "manual_review"
             row = connection.execute(
                 """
                 UPDATE delivery_attempt
-                SET status = %s, provider_message_id = %s, last_error_code = %s, finished_at = now()
+                SET status = %s, provider_message_id = %s, last_error_code = %s, finished_at = now(),
+                    lease_owner = NULL, lease_expires_at = NULL
                 WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
+                  AND lease_owner = %s AND lease_fence = %s
                 RETURNING *
                 """,
                 (
@@ -308,8 +487,18 @@ class PostgresDeliveryLedger:
                     attempt.tenant_id,
                     attempt.delivery_id,
                     attempt.attempt_no,
+                    attempt.lease_owner,
+                    attempt.lease_fence,
                 ),
             ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM delivery_attempt
+                    WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
+                    """,
+                    (attempt.tenant_id, attempt.delivery_id, attempt.attempt_no),
+                ).fetchone()
             return self._attempt(row)
 
     def unknown(self, tenant_id: str) -> list[DeliveryAttempt]:
@@ -353,7 +542,8 @@ class PostgresDeliveryLedger:
                 final_status = "manual_review"
             row = connection.execute(
                 """
-                UPDATE delivery_attempt SET status = %s, last_error_code = %s, finished_at = now()
+                UPDATE delivery_attempt SET status = %s, last_error_code = %s, finished_at = now(),
+                lease_owner = NULL, lease_expires_at = NULL
                 WHERE tenant_id = %s AND delivery_id = %s AND attempt_no = %s
                 RETURNING *
                 """,

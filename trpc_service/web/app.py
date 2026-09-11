@@ -69,6 +69,7 @@ from trpc_service.runtime import (
     SessionEventDraft,
     TenantContext,
     ToolCapability,
+    ToolRecoveryAction,
     ToolStatus,
     content_hash,
     stable_id,
@@ -194,14 +195,18 @@ class ServiceContainer:
             self.bus = RedisStreamMessageBus(self.settings.redis_url)
             self.secrets = EnvironmentSecretProvider()
             self.delivery_ledger = PostgresDeliveryLedger(
-                self.settings.database_url, self.settings.database_role
+                self.settings.database_url,
+                self.settings.database_role,
+                default_lease_seconds=self.settings.delivery_attempt_lease_seconds,
             )
         elif self.settings.runtime_backend == "memory":
             self.control = ControlPlane()
             self.store = InMemoryRuntimeStore()
             self.bus = InMemoryMessageBus()
             self.secrets = MockSecretProvider()
-            self.delivery_ledger = InMemoryDeliveryLedger()
+            self.delivery_ledger = InMemoryDeliveryLedger(
+                default_lease_seconds=self.settings.delivery_attempt_lease_seconds
+            )
         else:
             raise ValueError("TRPC_SERVICE_RUNTIME_BACKEND must be 'memory' or 'postgres'")
         self.runtime = PlatformRuntime(self.store, self.bus)
@@ -778,6 +783,65 @@ class ServiceContainer:
                     arguments=invocation.arguments,
                     capability=ToolCapability(selected_tool.retry_capability.value),
                 )
+                recovery_action = self.runtime.tool_recovery_action(context, intent.tool_call_id)
+                if intent.status == ToolStatus.SUCCEEDED:
+                    return dict(intent.result or {})
+                if intent.status == ToolStatus.RECONCILING:
+                    if recovery_action != ToolRecoveryAction.RECONCILE:
+                        raise RuntimeError("tool recovery state is inconsistent")
+                    reconcile = getattr(selected_tool, "reconcile", None)
+                    if not callable(reconcile):
+                        self.runtime.finish_tool(
+                            context,
+                            claim,
+                            intent.tool_call_id,
+                            status=ToolStatus.MANUAL_REVIEW,
+                            error_code="tool_adapter_has_no_reconciliation_operation",
+                        )
+                        raise RuntimeError("tool operation requires manual resolution")
+                    try:
+                        self.runtime.assert_execution(context, claim)
+                        reconciled = await reconcile(
+                            invocation.arguments,
+                            claim=claim,
+                            provider_operation_id=intent.provider_operation_id,
+                            idempotency_key=intent.provider_idempotency_key,
+                        )
+                    except Exception as exc:
+                        self.runtime.finish_tool(
+                            context,
+                            claim,
+                            intent.tool_call_id,
+                            status=ToolStatus.MANUAL_REVIEW,
+                            error_code=f"tool_reconciliation_{type(exc).__name__}",
+                        )
+                        raise RuntimeError("tool reconciliation requires manual resolution") from exc
+                    if reconciled is None:
+                        self.runtime.finish_tool(
+                            context,
+                            claim,
+                            intent.tool_call_id,
+                            status=ToolStatus.MANUAL_REVIEW,
+                            error_code="tool_reconciliation_inconclusive",
+                        )
+                        raise RuntimeError("tool reconciliation requires manual resolution")
+                    completed = self.runtime.finish_tool(
+                        context,
+                        claim,
+                        intent.tool_call_id,
+                        status=ToolStatus.SUCCEEDED,
+                        result=dict(reconciled),
+                        provider_operation_id=(
+                            str(reconciled["provider_operation_id"])
+                            if reconciled.get("provider_operation_id") is not None
+                            else None
+                        ),
+                    )
+                    return dict(completed.result or {})
+                if intent.status == ToolStatus.MANUAL_REVIEW:
+                    if recovery_action != ToolRecoveryAction.MANUAL_REVIEW:
+                        raise RuntimeError("tool recovery state is inconsistent")
+                    raise RuntimeError("tool operation requires manual resolution")
                 started = self.runtime.start_tool(context, claim, intent.tool_call_id)
                 if started.status == ToolStatus.SUCCEEDED:
                     return dict(started.result or {})
@@ -1288,7 +1352,15 @@ class ServiceContainer:
             capability=capability,
             request_hash=sha256(reply.plain_text().encode()).hexdigest(),
             trace_id=str(record.get("trace_id") or ""),
+            owner=self.settings.dispatcher_id,
+            lease_seconds=self.settings.delivery_attempt_lease_seconds,
         )
+        if attempt.status in {"sending", "reconciling"} and not attempt.lease_acquired:
+            # A reclaimed Stream message is not authority to duplicate the
+            # provider request while another dispatcher still owns its SQL
+            # attempt lease. Leave the entry pending for the owner/recovery.
+            self._record_delivery_outcome(record, binding, attempt)
+            return _json(attempt), False
         if attempt.status != "sending":
             if attempt.status == "accepted":
                 self.runtime.mark_outbox_delivered(
@@ -1379,7 +1451,7 @@ class ServiceContainer:
         # Only a provider with a deterministic idempotency key may be resent
         # automatically. Queryable providers stay pending for their actual
         # reconciliation operation; non-retriable providers require a human.
-        if capability == "idempotent" and final.status == "failed":
+        if capability == "idempotent" and final.status in {"failed", "unknown"}:
             self._record_delivery_outcome(record, binding, final)
             return _json(final), False
         if capability == "queryable" and final.status in {"failed", "unknown", "reconciling"}:
@@ -1430,7 +1502,11 @@ class ServiceContainer:
             ]
         group = consumer_group or "trpc-agent-delivery"
         consumer = self.settings.dispatcher_id
-        messages = self.bus.reclaim_idle(group, consumer, min_idle_ms=60_000)
+        messages = self.bus.reclaim_idle(
+            group,
+            consumer,
+            min_idle_ms=self.settings.delivery_attempt_lease_seconds * 1000,
+        )
         messages.extend(self.bus.consume(group, consumer, block_ms=250))
         outcomes: list[dict[str, Any]] = []
         for message_id, record in messages:

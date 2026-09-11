@@ -24,7 +24,24 @@ spec:
           ports: [{name: http, containerPort: 8000}]
           envFrom:
             - configMapRef: {name: trpc-agent-service}
-            - secretRef: {name: trpc-agent-service-secrets}
+          env:
+            - name: TRPC_SERVICE_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_SERVICE_API_DATABASE_URL}
+            - name: TRPC_SERVICE_DATABASE_ROLE
+              value: agent_api_gateway
+            - name: TRPC_SERVICE_REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_SERVICE_REDIS_URL}
+            - name: TRPC_SERVICE_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_SERVICE_ADMIN_API_KEY}
+            - name: TRPC_SERVICE_TENANT_API_KEYS
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_SERVICE_TENANT_API_KEYS, optional: true}
+            - name: TRPC_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef: {name: trpc-agent-service-secrets, key: TRPC_AGENT_API_KEY, optional: true}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -859,6 +859,39 @@ class PostgresRuntimeTransaction:
             tool = self._tool(existing)
             if tool.tool_name != tool_name or tool.arguments_hash != arguments_hash:
                 raise ExecutionDivergence("same deterministic tool step has different arguments")
+            if tool.lease_fence != claim.lease_fence and tool.status != ToolStatus.SUCCEEDED:
+                if tool.status in {ToolStatus.PREPARED, ToolStatus.CONFIRMED}:
+                    next_status = tool.status
+                    reason = tool.last_error_code
+                elif tool.retry_capability == ToolCapability.IDEMPOTENT:
+                    next_status = ToolStatus.PREPARED
+                    reason = "tool_lease_takeover_idempotent_retry"
+                elif tool.retry_capability == ToolCapability.QUERYABLE:
+                    next_status = ToolStatus.RECONCILING
+                    reason = "tool_lease_takeover_requires_reconciliation"
+                else:
+                    next_status = ToolStatus.MANUAL_REVIEW
+                    reason = "tool_lease_takeover_non_retriable"
+                row = self.connection.execute(
+                    """
+                    UPDATE tool_execution
+                    SET lease_fence = %s, routing_epoch = %s, security_epoch = %s,
+                        status = %s, last_error_code = %s, updated_at = %s
+                    WHERE tenant_id = %s AND tool_call_id = %s
+                    RETURNING *
+                    """,
+                    (
+                        claim.lease_fence,
+                        claim.routing_epoch,
+                        claim.security_epoch,
+                        next_status.value,
+                        reason,
+                        _now(),
+                        self._tenant(),
+                        tool.tool_call_id,
+                    ),
+                ).fetchone()
+                return self._tool(row)
             return tool
         now = _now()
         tool_call_id = stable_id("tool", claim.inbox_id, claim.execution_id, tool_step)

@@ -280,6 +280,58 @@ def test_tool_unknown_is_not_automatically_retried_and_reply_memory_are_durable(
     }
 
 
+def test_tool_intents_are_reowned_safely_after_an_execution_lease_takeover():
+    clock, runtime, context, _ = make_runtime()
+
+    def takeover(step: int, capability: ToolCapability, *, running: bool):
+        inbox = runtime.accept_inbound(context, envelope(f"provider:takeover:{step}", session=f"tool-{step}")).inbox
+        original = runtime.claim_execution(context, inbox.inbox_id, "worker-a", lease_seconds=5)
+        intent = runtime.prepare_tool(
+            context,
+            original,
+            tool_step=0,
+            tool_name=f"tool-{step}",
+            arguments={"step": step},
+            capability=capability,
+        )
+        if running:
+            runtime.start_tool(context, original, intent.tool_call_id)
+        clock.advance(6)
+        recovered_claim = runtime.claim_execution(
+            context, inbox.inbox_id, "worker-b", lease_seconds=5
+        )
+        recovered = runtime.prepare_tool(
+            context,
+            recovered_claim,
+            tool_step=0,
+            tool_name=f"tool-{step}",
+            arguments={"step": step},
+            capability=capability,
+        )
+        return intent, recovered_claim, recovered
+
+    prepared, prepared_claim, adopted_prepared = takeover(
+        1, ToolCapability.NON_RETRIABLE, running=False
+    )
+    assert adopted_prepared.lease_fence == prepared_claim.lease_fence
+    assert adopted_prepared.status == ToolStatus.PREPARED
+    assert runtime.start_tool(context, prepared_claim, adopted_prepared.tool_call_id).status == ToolStatus.RUNNING
+
+    idempotent, idempotent_claim, retried = takeover(2, ToolCapability.IDEMPOTENT, running=True)
+    assert retried.status == ToolStatus.PREPARED
+    assert retried.provider_idempotency_key == idempotent.provider_idempotency_key
+    assert runtime.start_tool(context, idempotent_claim, retried.tool_call_id).status == ToolStatus.RUNNING
+
+    _, queryable_claim, reconciling = takeover(3, ToolCapability.QUERYABLE, running=True)
+    assert reconciling.status == ToolStatus.RECONCILING
+    assert reconciling.lease_fence == queryable_claim.lease_fence
+    assert runtime.tool_recovery_action(context, reconciling.tool_call_id) == ToolRecoveryAction.RECONCILE
+
+    _, _, review = takeover(4, ToolCapability.NON_RETRIABLE, running=True)
+    assert review.status == ToolStatus.MANUAL_REVIEW
+    assert runtime.tool_recovery_action(context, review.tool_call_id) == ToolRecoveryAction.MANUAL_REVIEW
+
+
 def test_same_session_can_emit_a_reply_for_each_inbound_message():
     _, runtime, context, _ = make_runtime()
     first = runtime.accept_inbound(context, envelope("provider:one")).inbox

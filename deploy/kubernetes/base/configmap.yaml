@@ -3,6 +3,7 @@ kind: ConfigMap
 metadata:
   name: trpc-agent-service
 data:
+  TRPC_SERVICE_ENVIRONMENT: production
   TRPC_SERVICE_RUNTIME_BACKEND: postgres
   TRPC_SERVICE_LOG_LEVEL: INFO
   TRPC_SERVICE_WORKER_ID: worker

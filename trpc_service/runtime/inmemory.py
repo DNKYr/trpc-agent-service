@@ -537,6 +537,30 @@ class InMemoryRuntimeTransaction:
             existing = self._store._data.tools[(claim.tenant_id, existing_id)]
             if existing.arguments_hash != arguments_hash or existing.tool_name != tool_name:
                 raise ExecutionDivergence("same deterministic tool step has different arguments")
+            if existing.lease_fence != claim.lease_fence and existing.status != ToolStatus.SUCCEEDED:
+                # A new fenced execution owns the same deterministic tool
+                # intent. Never create a second intent: prepared work may run,
+                # idempotent work may retry with its original provider key,
+                # queryable work must reconcile, and non-retriable work stops
+                # for an operator.
+                if existing.status in {ToolStatus.PREPARED, ToolStatus.CONFIRMED}:
+                    next_status = existing.status
+                    reason = existing.last_error_code
+                elif existing.retry_capability == ToolCapability.IDEMPOTENT:
+                    next_status = ToolStatus.PREPARED
+                    reason = "tool_lease_takeover_idempotent_retry"
+                elif existing.retry_capability == ToolCapability.QUERYABLE:
+                    next_status = ToolStatus.RECONCILING
+                    reason = "tool_lease_takeover_requires_reconciliation"
+                else:
+                    next_status = ToolStatus.MANUAL_REVIEW
+                    reason = "tool_lease_takeover_non_retriable"
+                existing.lease_fence = claim.lease_fence
+                existing.routing_epoch = claim.routing_epoch
+                existing.security_epoch = claim.security_epoch
+                existing.status = next_status
+                existing.last_error_code = reason
+                existing.updated_at = self._now()
             return deepcopy(existing)
         now = self._now()
         tool_call_id = stable_id("tool", claim.inbox_id, claim.execution_id, tool_step)

@@ -1,4 +1,9 @@
-"""Install the reviewed schema, protected locator, and tenant RLS policies."""
+"""Install the immutable initial schema and tenant RLS policies.
+
+The files read here are snapshots owned by this revision. They must never be
+replaced from ``docs/``: documentation describes the current schema, while a
+migration must continue to describe the schema it originally published.
+"""
 
 from __future__ import annotations
 
@@ -13,12 +18,12 @@ depends_on = None
 
 
 def _read(name: str) -> str:
-    return (Path(__file__).resolve().parents[2] / "docs" / name).read_text(encoding="utf-8")
+    return (Path(__file__).with_name("_snapshots") / name).read_text(encoding="utf-8")
 
 
 def upgrade() -> None:
-    op.execute(_read("schema.sql"))
-    op.execute(_read("rls.sql"))
+    op.execute(_read("0001_platform_schema.sql"))
+    op.execute(_read("0001_platform_rls.sql"))
 
 
 def downgrade() -> None:

@@ -2,8 +2,12 @@
 
 Create the referenced Kubernetes Secret through External Secrets, Sealed Secrets,
 or your cloud secret manager. It must provide at least
-`TRPC_SERVICE_DATABASE_URL` and `TRPC_SERVICE_REDIS_URL`; model and channel
-credentials are optional for mock mode. Never commit a populated Secret manifest.
+the per-workload URL keys `TRPC_SERVICE_API_DATABASE_URL`,
+`TRPC_SERVICE_WORKER_DATABASE_URL`, `TRPC_SERVICE_DISPATCHER_DATABASE_URL`,
+`TRPC_SERVICE_MIGRATOR_DATABASE_URL`, and `TRPC_SERVICE_AIBOT_DATABASE_URL`,
+plus `TRPC_SERVICE_REDIS_URL` and `TRPC_SERVICE_ADMIN_API_KEY`. Model and
+channel credentials are optional for mock mode. Never commit a populated Secret
+manifest or reuse the migrator URL in a data-plane workload.
 
 ```bash
 helm upgrade --install trpc-agent-service . \
