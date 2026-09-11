@@ -1204,7 +1204,11 @@ class ServiceContainer:
             "wecom": "non_retriable",
             "wecom_aibot": "non_retriable",
         }
-        capability = capability_by_provider.get(binding.provider, "non_retriable")
+        adapter_capability = getattr(adapter, "delivery_capability", None)
+        if callable(adapter_capability):
+            capability = str(adapter_capability(self.adapter_binding(binding)))
+        else:
+            capability = capability_by_provider.get(binding.provider, "non_retriable")
         attempt = self.delivery_ledger.begin(
             tenant_id=tenant_id,
             outbox_id=outbox_id,

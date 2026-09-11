@@ -675,6 +675,8 @@ class MockChannelAdapter:
 
     Re-submit an identical event ID to simulate provider callback retries.  Delivery
     outcomes can be queued per binding to exercise accepted, failed, and unknown paths.
+    ``unknown_accepted`` simulates a provider that applied a request but lost its
+    synchronous acknowledgement; its query endpoint can later prove delivery.
     """
 
     provider = "mock"
@@ -686,9 +688,19 @@ class MockChannelAdapter:
         self._accepted_delivery_ids: dict[str, str] = {}
 
     def queue_delivery_outcome(self, binding_id: str, outcome: str) -> None:
-        if outcome not in {"accepted", "failed", "unknown"}:
-            raise ValueError("outcome must be accepted, failed, or unknown")
+        if outcome not in {"accepted", "failed", "unknown", "unknown_accepted"}:
+            raise ValueError("outcome must be accepted, failed, unknown, or unknown_accepted")
         self._delivery_outcomes[binding_id].append(outcome)
+
+    @staticmethod
+    def delivery_capability(binding: ChannelBinding) -> DeliveryCapability:
+        """Select the recovery contract used by a focused integration binding."""
+
+        raw = str(binding.capabilities.get("delivery_capability", DeliveryCapability.IDEMPOTENT))
+        try:
+            return DeliveryCapability(raw)
+        except ValueError as exc:
+            raise ChannelError("invalid_delivery_capability", "mock delivery capability is invalid") from exc
 
     async def validate_and_normalize(
         self, binding: ChannelBinding, request: CallbackRequest
@@ -760,10 +772,11 @@ class MockChannelAdapter:
     async def deliver(self, binding: ChannelBinding, reply: ReplyEnvelope) -> DeliveryResult:
         binding.require_active(self.provider)
         self.deliveries.append(reply)
+        capability = self.delivery_capability(binding)
         if reply.delivery_id in self._accepted_delivery_ids:
             return DeliveryResult(
                 "accepted",
-                DeliveryCapability.IDEMPOTENT,
+                capability,
                 provider_message_id=self._accepted_delivery_ids[reply.delivery_id],
             )
         outcome = (
@@ -774,13 +787,47 @@ class MockChannelAdapter:
         if outcome == "accepted":
             provider_id = _stable_id("mock_msg", binding.binding_id, reply.delivery_id)
             self._accepted_delivery_ids[reply.delivery_id] = provider_id
+            return DeliveryResult("accepted", capability, provider_message_id=provider_id)
+        if outcome == "unknown_accepted":
+            provider_id = _stable_id("mock_msg", binding.binding_id, reply.delivery_id)
+            self._accepted_delivery_ids[reply.delivery_id] = provider_id
             return DeliveryResult(
-                "accepted", DeliveryCapability.IDEMPOTENT, provider_message_id=provider_id
+                "unknown", DeliveryCapability.QUERYABLE, error_code="simulated_lost_ack"
             )
         if outcome == "unknown":
             return DeliveryResult(
-                "unknown", DeliveryCapability.NON_RETRIABLE, error_code="simulated_crash_gap"
+                "unknown", capability, error_code="simulated_crash_gap"
             )
         return DeliveryResult(
-            "failed", DeliveryCapability.IDEMPOTENT, error_code="simulated_provider_failure"
+            "failed", capability, error_code="simulated_provider_failure"
+        )
+
+    async def reconcile_delivery(
+        self,
+        binding: ChannelBinding,
+        reply: ReplyEnvelope,
+        *,
+        provider_message_id: str | None,
+        provider_idempotency_key: str | None,
+    ) -> DeliveryResult | None:
+        """Concrete provider-query seam used to prove an ambiguous mock send.
+
+        Real adapters must implement the same operation only when their provider
+        exposes a queryable delivery identifier.  Returning ``reconciling`` is
+        deliberately distinct from resending the original message.
+        """
+
+        del provider_message_id, provider_idempotency_key
+        binding.require_active(self.provider)
+        if self.delivery_capability(binding) != DeliveryCapability.QUERYABLE:
+            raise ChannelError(
+                "mock_delivery_not_queryable", "mock binding was not configured as queryable"
+            )
+        provider_id = self._accepted_delivery_ids.get(reply.delivery_id)
+        if provider_id:
+            return DeliveryResult(
+                "accepted", DeliveryCapability.QUERYABLE, provider_message_id=provider_id
+            )
+        return DeliveryResult(
+            "reconciling", DeliveryCapability.QUERYABLE, error_code="mock_query_inconclusive"
         )
