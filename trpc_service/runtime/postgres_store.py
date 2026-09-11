@@ -1284,6 +1284,77 @@ class PostgresRuntimeTransaction:
         ).fetchone()
         return self._memory(row) if row else None
 
+    def put_knowledge_document(self, document: dict) -> dict[str, Any]:
+        """Upsert operator-submitted text and enqueue a durable projection event."""
+
+        document_id = str(document.get("document_id") or "")
+        knowledge_base_id = str(document.get("knowledge_base_id") or "")
+        content = str(document.get("content") or "")
+        checksum = str(document.get("checksum") or "")
+        acl = document.get("acl") or {}
+        if not document_id or not knowledge_base_id or not content.strip() or not checksum:
+            raise ValueError("knowledge document requires id, base, content, and checksum")
+        if len(content) > 200_000 or not isinstance(acl, Mapping):
+            raise ValueError("knowledge document content or ACL is invalid")
+        conflict = self.connection.execute(
+            """
+            SELECT document_id FROM knowledge_document
+            WHERE tenant_id = %s AND knowledge_base_id = %s AND checksum = %s
+              AND document_id <> %s
+            FOR UPDATE
+            """,
+            (self._tenant(), knowledge_base_id, checksum, document_id),
+        ).fetchone()
+        if conflict is not None:
+            raise ExecutionDivergence("knowledge content already has a different document id")
+        now = _now()
+        row = self.connection.execute(
+            """
+            INSERT INTO knowledge_document
+            (tenant_id, document_id, knowledge_base_id, object_uri, content, checksum, acl,
+             version, index_status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 1, 'pending', %s, %s)
+            ON CONFLICT (tenant_id, document_id) DO UPDATE
+            SET knowledge_base_id = EXCLUDED.knowledge_base_id,
+                object_uri = EXCLUDED.object_uri,
+                content = EXCLUDED.content,
+                checksum = EXCLUDED.checksum,
+                acl = EXCLUDED.acl,
+                version = knowledge_document.version + 1,
+                index_status = 'pending',
+                updated_at = EXCLUDED.updated_at
+            RETURNING *
+            """,
+            (
+                self._tenant(),
+                document_id,
+                knowledge_base_id,
+                str(document.get("object_uri") or f"db://knowledge/{document_id}"),
+                content,
+                checksum,
+                _json(dict(acl)),
+                now,
+                now,
+            ),
+        ).fetchone()
+        result = dict(row)
+        result["acl"] = dict(result.get("acl") or {})
+        self._insert_outbox(
+            aggregate_type="knowledge",
+            aggregate_id=document_id,
+            inbox_id=None,
+            event_type="knowledge.project",
+            payload={
+                "tenant_id": self._tenant(),
+                "document_id": document_id,
+                "requested_version": int(result["version"]),
+            },
+            idempotency_key=f"knowledge:{document_id}:{result['version']}",
+            trace_id=self.context.trace_id,
+            now=now,
+        )
+        return result
+
     def list_outbox(self) -> list[OutboxRecord]:
         rows = self.connection.execute(
             "SELECT * FROM outbox WHERE tenant_id = %s ORDER BY created_at, outbox_id",
@@ -1642,6 +1713,7 @@ class PostgresRuntimeTransaction:
             "events": ("session_event", self._event),
             "summaries": ("session_summary", self._summary),
             "memories": ("memory", self._memory),
+            "knowledge": ("knowledge_document", lambda row: dict(row)),
             "tools": ("tool_execution", self._tool),
             "migrations": ("storage_migration", self._migration),
         }

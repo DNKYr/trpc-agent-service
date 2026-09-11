@@ -87,6 +87,7 @@ from .schemas import (
     AgentCreate,
     BudgetCreate,
     ChannelCreate,
+    KnowledgeDocumentCreate,
     MigrationAction,
     MigrationCreate,
     OperationResponse,
@@ -511,6 +512,45 @@ class ServiceContainer:
             metadata=metadata,
         )
 
+    def put_knowledge_document(
+        self,
+        tenant_id: str,
+        body: KnowledgeDocumentCreate,
+        request_id: str,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        """Accept text through the authenticated control plane and queue projection."""
+
+        content = body.content.strip()
+        checksum = sha256(content.encode("utf-8")).hexdigest()
+        context = _context(tenant_id, request_id, trace_id, actor="admin")
+        row = self.runtime.put_knowledge_document(
+            context,
+            {
+                "document_id": body.document_id,
+                "knowledge_base_id": body.knowledge_base_id,
+                "content": content,
+                "checksum": checksum,
+                "acl": body.acl,
+            },
+        )
+        self._record_audit(
+            context,
+            "knowledge_document_upserted",
+            f"{body.document_id}:{row['version']}",
+            metadata={
+                "reason_code": "knowledge_projection_queued",
+                "input_hash": checksum,
+            },
+        )
+        # The response confirms only durable metadata; document text stays in
+        # the tenant-scoped store and is never reflected to admin logs.
+        return {
+            key: _json(value)
+            for key, value in row.items()
+            if key not in {"content", "acl"}
+        }
+
     def _record_execution_failure(
         self, context: TenantContext, inbox_id: str, error: Exception
     ) -> None:
@@ -609,7 +649,11 @@ class ServiceContainer:
         return result, current_claim
 
     def _session_context(
-        self, context: TenantContext, inbox: Mapping[str, Any], user_text: str
+        self,
+        context: TenantContext,
+        inbox: Mapping[str, Any],
+        user_text: str,
+        knowledge_config: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Load persisted session events and memory before constructing model input."""
 
@@ -665,9 +709,31 @@ class ServiceContainer:
         route = self.runtime.current_route(context)
         if route is not None:
             try:
-                knowledge = self.storage_profiles.search(
+                retrieved = self.storage_profiles.search(
                     context.tenant_id, route.profile, user_text, limit=8
                 )
+                allowed_bases = (knowledge_config or {}).get("knowledge_base_ids")
+                allowed_base_ids = (
+                    {str(value) for value in allowed_bases if isinstance(value, str)}
+                    if isinstance(allowed_bases, list)
+                    else None
+                )
+                for item in retrieved:
+                    if item.get("kind") != "knowledge":
+                        continue
+                    metadata = item.get("metadata")
+                    metadata = metadata if isinstance(metadata, Mapping) else {}
+                    base_id = str(metadata.get("knowledge_base_id") or "")
+                    if allowed_base_ids is not None and base_id not in allowed_base_ids:
+                        continue
+                    acl = metadata.get("acl")
+                    acl = acl if isinstance(acl, Mapping) else {}
+                    allowed_subjects = acl.get("subject_ids", acl.get("subjects"))
+                    if isinstance(allowed_subjects, list) and subject_id not in {
+                        str(value) for value in allowed_subjects
+                    } and "*" not in allowed_subjects:
+                        continue
+                    knowledge.append(item)
             except StorageMigrationError:
                 # Canonical memory remains available even if an optional
                 # retrieval profile is temporarily unavailable.
@@ -817,7 +883,12 @@ class ServiceContainer:
         result, claim = await self._run_with_execution_heartbeat(
             context,
             claim,
-            agent.run(input_text, self._session_context(context, inbox, input_text)),
+            agent.run(
+                input_text,
+                self._session_context(
+                    context, inbox, input_text, release_record.knowledge_config
+                ),
+            ),
         )
         self.runtime.assert_execution(context, claim)
         events = [
@@ -1074,7 +1145,7 @@ class ServiceContainer:
                                         self.settings.worker_id,
                                     )
                                 )
-                        elif event_type == "memory.project" and record_tenant:
+                        elif event_type in {"memory.project", "knowledge.project"} and record_tenant:
                             self._project_active_storage(
                                 _context(
                                     record_tenant,
@@ -1124,7 +1195,7 @@ class ServiceContainer:
                     except Exception as exc:
                         self._record_execution_failure(execution_context, event.inbox_id, exc)
                         continue
-            elif event.event_type == "memory.project":
+            elif event.event_type in {"memory.project", "knowledge.project"}:
                 record_trace = _trace_from_outbox_record(to_primitive(event), request_id, trace_id)
                 with bind_trace_context(record_trace):
                     self._project_active_storage(
@@ -1649,6 +1720,22 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
                 {"profile": body.target_profile},
                 migration_id=stable_id("mig", tenant_id, body.source_profile, body.target_profile),
             )
+        )
+
+    @app.post(
+        "/admin/v1/tenants/{tenant_id}/knowledge/documents",
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_admin)],
+    )
+    async def put_knowledge_document(
+        tenant_id: str,
+        body: KnowledgeDocumentCreate,
+        request: Request,
+        services: ServiceContainer = Depends(get_services),
+    ) -> dict[str, Any]:
+        trace = extract_trace_context(request.headers)
+        return services.put_knowledge_document(
+            tenant_id, body, trace.request_id, trace.trace_id
         )
 
     @app.get(

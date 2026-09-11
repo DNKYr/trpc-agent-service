@@ -85,6 +85,15 @@ class MigrationAction(ApiModel):
     ]
 
 
+class KnowledgeDocumentCreate(ApiModel):
+    """Tenant-local text to persist and project into the active retrieval profile."""
+
+    document_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$")
+    knowledge_base_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$")
+    content: str = Field(min_length=1, max_length=200_000)
+    acl: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunRequest(ApiModel):
     input: str = Field(min_length=1, max_length=100_000)
     session_key: str | None = Field(default=None, max_length=512)

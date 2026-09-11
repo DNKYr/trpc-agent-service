@@ -273,6 +273,10 @@ CREATE TABLE knowledge_document (
     document_id        text NOT NULL,
     knowledge_base_id  text NOT NULL,
     object_uri         text NOT NULL,
+    -- Small, operator-submitted text documents are stored canonically so the
+    -- worker can project and retrieve them without trusting an arbitrary URI.
+    -- An empty value remains valid for legacy object-backed rows.
+    content            text NOT NULL DEFAULT '' CHECK (char_length(content) <= 200000),
     checksum           text NOT NULL,
     acl                 jsonb NOT NULL DEFAULT '{}'::jsonb,
     version            bigint NOT NULL DEFAULT 1,

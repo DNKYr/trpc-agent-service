@@ -222,6 +222,29 @@ class StorageProfileRouter:
                         metadata={"session_id": str(summary["session_id"])},
                     )
                 )
+        for document in snapshot.get("knowledge", []):
+            if not isinstance(document, Mapping) or not isinstance(document.get("content"), str):
+                continue
+            content = str(document["content"])
+            if not content.strip():
+                continue
+            document_id = str(document.get("document_id") or "")
+            knowledge_base_id = str(document.get("knowledge_base_id") or "")
+            if not document_id or not knowledge_base_id:
+                continue
+            acl = document.get("acl")
+            records.append(
+                StorageRecord(
+                    record_id=f"knowledge:{document_id}",
+                    kind="knowledge",
+                    version=int(document.get("version", 1)),
+                    text=content,
+                    metadata={
+                        "knowledge_base_id": knowledge_base_id,
+                        "acl": dict(acl) if isinstance(acl, Mapping) else {},
+                    },
+                )
+            )
         return records
 
     def copy(self, tenant_id: str, profile: Mapping[str, Any], snapshot: Mapping[str, Any]) -> str:

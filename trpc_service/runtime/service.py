@@ -124,6 +124,12 @@ class PlatformRuntime:
         with self.store.transaction(context) as tx:
             return tx.commit_execution(claim, commit)
 
+    def put_knowledge_document(self, context: TenantContext, document: Mapping[str, Any]) -> dict:
+        """Persist a tenant knowledge fact and queue its retrieval projection."""
+
+        with self.store.transaction(context) as tx:
+            return tx.put_knowledge_document(dict(document))
+
     def put_budget_account(self, context: TenantContext, account: BudgetAccount) -> BudgetAccount:
         with self.store.transaction(context) as tx:
             return tx.put_budget_account(account)

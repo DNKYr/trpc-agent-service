@@ -401,6 +401,7 @@ class KnowledgeDocument(Base):
     document_id: Mapped[str] = mapped_column(Text, primary_key=True)
     knowledge_base_id: Mapped[str] = mapped_column(Text, nullable=False)
     object_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     checksum: Mapped[str] = mapped_column(Text, nullable=False)
     acl: Mapped[dict[str, Any]] = mapped_column(JsonValue, nullable=False, default=dict)
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)

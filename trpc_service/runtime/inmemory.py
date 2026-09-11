@@ -81,6 +81,7 @@ class _RuntimeData:
     tools: dict[tuple[str, str], ToolExecution] = field(default_factory=dict)
     tool_by_step: dict[tuple[str, str, int], str] = field(default_factory=dict)
     memories: dict[tuple[str, str], MemoryIntent] = field(default_factory=dict)
+    knowledge_documents: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     audits: dict[str, list[AuditRecord]] = field(default_factory=dict)
     routes: dict[tuple[str, int], StorageRoute] = field(default_factory=dict)
     migrations: dict[tuple[str, str], StorageMigration] = field(default_factory=dict)
@@ -826,6 +827,60 @@ class InMemoryRuntimeTransaction:
         value = self._store._data.memories.get(self._key(memory_id))
         return deepcopy(value) if value else None
 
+    def put_knowledge_document(self, document: dict) -> dict:
+        """Store canonical text and queue an idempotent retrieval projection."""
+
+        tenant_id = self._tenant()
+        document_id = str(document.get("document_id") or "")
+        knowledge_base_id = str(document.get("knowledge_base_id") or "")
+        content = str(document.get("content") or "")
+        checksum = str(document.get("checksum") or "")
+        acl = document.get("acl") or {}
+        if not document_id or not knowledge_base_id or not content.strip() or not checksum:
+            raise ValueError("knowledge document requires id, base, content, and checksum")
+        if len(content) > 200_000 or not isinstance(acl, Mapping):
+            raise ValueError("knowledge document content or ACL is invalid")
+        for (row_tenant, row_id), row in self._store._data.knowledge_documents.items():
+            if (
+                row_tenant == tenant_id
+                and row_id != document_id
+                and row["knowledge_base_id"] == knowledge_base_id
+                and row["checksum"] == checksum
+            ):
+                raise ExecutionDivergence("knowledge content already has a different document id")
+        now = self._now()
+        key = (tenant_id, document_id)
+        previous = self._store._data.knowledge_documents.get(key)
+        version = int(previous["version"]) + 1 if previous else 1
+        row = {
+            "tenant_id": tenant_id,
+            "document_id": document_id,
+            "knowledge_base_id": knowledge_base_id,
+            "object_uri": str(document.get("object_uri") or f"db://knowledge/{document_id}"),
+            "content": content,
+            "checksum": checksum,
+            "acl": deepcopy(dict(acl)),
+            "version": version,
+            "index_status": "pending",
+            "created_at": previous["created_at"] if previous else now,
+            "updated_at": now,
+        }
+        self._store._data.knowledge_documents[key] = row
+        self._insert_outbox(
+            aggregate_type="knowledge",
+            aggregate_id=document_id,
+            inbox_id=None,
+            event_type="knowledge.project",
+            payload={
+                "tenant_id": tenant_id,
+                "document_id": document_id,
+                "requested_version": version,
+            },
+            idempotency_key=f"knowledge:{document_id}:{version}",
+            trace_id=self.context.trace_id,
+        )
+        return deepcopy(row)
+
     def list_outbox(self) -> list[OutboxRecord]:
         tenant_id = self._tenant()
         return deepcopy(
@@ -1054,6 +1109,11 @@ class InMemoryRuntimeTransaction:
             "memories": [
                 to_primitive(value)
                 for (row_tenant, _), value in self._store._data.memories.items()
+                if row_tenant == tenant_id
+            ],
+            "knowledge": [
+                to_primitive(value)
+                for (row_tenant, _), value in self._store._data.knowledge_documents.items()
                 if row_tenant == tenant_id
             ],
             "tools": [

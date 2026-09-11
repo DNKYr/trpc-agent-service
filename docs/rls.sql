@@ -202,7 +202,7 @@ GRANT SELECT, INSERT ON audit_dedup TO agent_dispatcher;
 -- Admin is still tenant scoped. Cross-tenant jobs iterate one SET LOCAL scope at a time.
 GRANT INSERT, UPDATE ON tenant_locator TO agent_admin;
 GRANT SELECT, INSERT, UPDATE ON tenant, tenant_runtime_state,
-    agent_app, channel_binding, identity_mapping, budget_account
+    agent_app, channel_binding, identity_mapping, knowledge_document, budget_account
     TO agent_admin;
 GRANT SELECT, INSERT ON agent_release, storage_route, storage_migration TO agent_admin;
 GRANT UPDATE (release_status) ON agent_release TO agent_admin;
