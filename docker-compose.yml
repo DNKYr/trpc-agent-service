@@ -88,6 +88,8 @@ services:
     env_file:
       - path: .worker.env
         required: true
+    volumes:
+      - storage-profiles:/var/lib/trpc-storage
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -124,4 +126,5 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  storage-profiles:
   minio-data:

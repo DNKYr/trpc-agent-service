@@ -8,7 +8,7 @@ the final Session commit.  It is not intended as a production persistence layer.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -49,6 +49,7 @@ from .models import (
     ReservationStatus,
     SessionEvent,
     SessionRecord,
+    SessionSummary,
     StorageMigration,
     StorageRoute,
     TenantContext,
@@ -72,6 +73,7 @@ class _RuntimeData:
     outbox_by_idempotency: dict[tuple[str, str], str] = field(default_factory=dict)
     sessions: dict[tuple[str, str], SessionRecord] = field(default_factory=dict)
     events: dict[tuple[str, str], list[SessionEvent]] = field(default_factory=dict)
+    summaries: dict[tuple[str, str], list[SessionSummary]] = field(default_factory=dict)
     budgets: dict[tuple[str, str], BudgetAccount] = field(default_factory=dict)
     reservations: dict[tuple[str, str], BudgetReservation] = field(default_factory=dict)
     reservations_by_execution: dict[tuple[str, str, str], str] = field(default_factory=dict)
@@ -82,6 +84,38 @@ class _RuntimeData:
     audits: dict[str, list[AuditRecord]] = field(default_factory=dict)
     routes: dict[tuple[str, int], StorageRoute] = field(default_factory=dict)
     migrations: dict[tuple[str, str], StorageMigration] = field(default_factory=dict)
+
+
+_AUDIT_TEXT_FIELDS = {
+    "channel",
+    "subject_id",
+    "agent_name",
+    "tool_name",
+    "policy_version",
+    "reason_code",
+    "error_type",
+    "input_hash",
+    "output_hash",
+    "encrypted_detail_ref",
+}
+_AUDIT_INTEGER_FIELDS = {"latency_ms", "token_in", "token_out", "cost_micros"}
+
+
+def _audit_fields(metadata: object) -> dict[str, object]:
+    """Whitelist typed audit metadata; raw model/channel payloads never enter audit rows."""
+
+    if not isinstance(metadata, Mapping):
+        return {}
+    fields: dict[str, object] = {}
+    for key in _AUDIT_TEXT_FIELDS:
+        value = metadata.get(key)
+        if isinstance(value, str):
+            fields[key] = value[:512]
+    for key in _AUDIT_INTEGER_FIELDS:
+        value = metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            fields[key] = value
+    return fields
 
 
 class InMemoryRuntimeStore:
@@ -616,6 +650,36 @@ class InMemoryRuntimeTransaction:
             return "reconcile"
         return "manual_review"
 
+    def _summarize_session(
+        self, session: SessionRecord, appended_events: list[SessionEvent], now
+    ) -> SessionSummary | None:
+        """Create a deterministic summary from committed conversational events only."""
+
+        all_events = self._store._data.events.get((session.tenant_id, session.session_id), [])
+        lines: list[str] = []
+        for event in all_events[-24:]:
+            if event.role not in {"user", "assistant"}:
+                continue
+            text = event.payload.get("text")
+            if isinstance(text, str) and text.strip():
+                lines.append(f"{event.role}: {' '.join(text.split())[:800]}")
+        if not lines or not appended_events:
+            return None
+        content = "\n".join(lines)[-6000:]
+        based_on_seq = appended_events[-1].seq
+        return SessionSummary(
+            tenant_id=session.tenant_id,
+            session_id=session.session_id,
+            summary_id=stable_id("sum", session.session_id, based_on_seq, content_hash(content)),
+            based_on_seq=based_on_seq,
+            content=content,
+            content_hash=content_hash(content),
+            model_ref=(
+                str(session.state.get("model")) if isinstance(session.state.get("model"), str) else None
+            ),
+            created_at=now,
+        )
+
     def commit_execution(self, claim: ExecutionClaim, commit: CommitInput) -> CommitResult:
         self.assert_execution(claim)
         session = self._require_session(claim.session_id)
@@ -663,6 +727,11 @@ class InMemoryRuntimeTransaction:
         session.lease_owner = None
         session.lease_expires_at = None
         session.updated_at = now
+        summary = self._summarize_session(session, events, now)
+        if summary is not None:
+            self._store._data.summaries.setdefault(
+                (claim.tenant_id, session.session_id), []
+            ).append(summary)
         memory_outboxes: list[OutboxRecord] = []
         for position, draft in enumerate(commit.memories):
             memory_id = draft.memory_id or stable_id(
@@ -741,12 +810,14 @@ class InMemoryRuntimeTransaction:
             trace_id=inbox.trace_id,
             request_id=inbox.request_id,
             session_id=session.session_id,
+            **_audit_fields(commit.audit_metadata),
         )
         self._store._data.audits.setdefault(claim.tenant_id, []).append(audit)
         return CommitResult(
             session=deepcopy(session),
             inbox=deepcopy(inbox),
             events=deepcopy(events),
+            summary=deepcopy(summary),
             reply_outbox=deepcopy(reply_outbox),
             memory_outboxes=deepcopy(memory_outboxes),
         )
@@ -839,6 +910,9 @@ class InMemoryRuntimeTransaction:
             migration.status = MigrationStatus.BACKFILLING
         elif action == "catch_up" and migration.status == MigrationStatus.BACKFILLING:
             migration.status = MigrationStatus.CATCHING_UP
+            migration.source_watermark = source_watermark
+            migration.target_watermark = target_watermark
+        elif action == "record_catch_up" and migration.status == MigrationStatus.CATCHING_UP:
             migration.source_watermark = source_watermark
             migration.target_watermark = target_watermark
         elif action == "begin_drain" and migration.status == MigrationStatus.CATCHING_UP:
@@ -934,6 +1008,12 @@ class InMemoryRuntimeTransaction:
             "events": [
                 to_primitive(value)
                 for (row_tenant, _), values in self._store._data.events.items()
+                if row_tenant == tenant_id
+                for value in values
+            ],
+            "summaries": [
+                to_primitive(value)
+                for (row_tenant, _), values in self._store._data.summaries.items()
                 if row_tenant == tenant_id
                 for value in values
             ],

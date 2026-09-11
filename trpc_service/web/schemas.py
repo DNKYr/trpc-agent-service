@@ -83,9 +83,6 @@ class MigrationAction(ApiModel):
     action: Literal[
         "prepare", "backfill", "catch_up", "drain", "verify", "cutover", "rollback", "cancel"
     ]
-    source_watermark: str | None = Field(default=None, max_length=512)
-    target_watermark: str | None = Field(default=None, max_length=512)
-    verified: bool | None = None
 
 
 class RunRequest(ApiModel):

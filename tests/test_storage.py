@@ -1,6 +1,11 @@
 import pytest
 
-from trpc_service.storage import LocalArtifactStore, LocalVectorStore, MemoryProjectionWorker
+from trpc_service.storage import (
+    LocalArtifactStore,
+    LocalVectorStore,
+    MemoryProjectionWorker,
+    StorageProfileRouter,
+)
 from trpc_service.storage.adapters import StorageError
 
 
@@ -23,3 +28,36 @@ def test_local_artifact_checksum_and_tenant_boundary(tmp_path):
     assert store.get("a", "art-1") == b"safe artifact"
     with pytest.raises(StorageError):
         store.get("b", "art-1")
+
+
+def test_storage_profile_copy_verifies_manifest_and_selects_active_profile(tmp_path):
+    router = StorageProfileRouter(root=tmp_path)
+    snapshot = {
+        "memories": [
+            {
+                "memory_id": "preference",
+                "memory_type": "fact",
+                "version": 2,
+                "content": "Alice prefers tea",
+            }
+        ],
+        "summaries": [
+            {
+                "session_id": "session-1",
+                "based_on_seq": 4,
+                "content": "user: I like tea",
+            }
+        ],
+    }
+    profile = {"profile": "filesystem-secondary"}
+
+    copied = router.copy("tenant-a", profile, snapshot)
+    verified, source, target = router.verify("tenant-a", profile, snapshot)
+
+    assert verified is True
+    assert copied == source == target
+    assert router.search("tenant-a", profile, "tea")[0]["record_id"] == "memory:preference"
+
+    changed = {**snapshot, "memories": []}
+    verified, _, _ = router.verify("tenant-a", profile, changed)
+    assert verified is False

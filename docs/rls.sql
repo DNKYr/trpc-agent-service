@@ -170,11 +170,18 @@ GRANT SELECT, INSERT, UPDATE ON inbox, outbox TO agent_gateway;
 -- Worker: all Session-side operations remain tenant scoped; no tenant/config mutation.
 GRANT SELECT ON tenant, tenant_runtime_state, storage_route, storage_migration, agent_app, agent_release,
     channel_binding, identity_mapping, knowledge_document TO agent_worker;
+-- Migration workers enumerate only tenant identifiers, then open a separate
+-- RLS-scoped transaction per tenant.  They never receive a cross-tenant data
+-- query capability.
+GRANT SELECT ON tenant_locator TO agent_worker;
 GRANT SELECT, INSERT, UPDATE ON session, session_summary, memory,
     memory_projection, artifact, inbox, outbox, execution_attempt, budget_account,
     budget_reservation, tool_execution TO agent_worker;
 GRANT SELECT, INSERT ON session_event TO agent_worker;
 GRANT INSERT ON audit_log TO agent_worker;
+GRANT UPDATE (status, source_watermark, target_watermark, error, updated_at)
+    ON storage_migration TO agent_worker;
+GRANT UPDATE (execution_mode, security_epoch, updated_at) ON tenant_runtime_state TO agent_worker;
 
 -- Dispatcher/Reconciler: publish Outbox and update projections/delivery attempts.
 GRANT SELECT ON tenant_locator TO agent_dispatcher;

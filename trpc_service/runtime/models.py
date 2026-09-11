@@ -268,6 +268,25 @@ class SessionEvent:
     occurred_at: datetime
 
 
+@dataclass(slots=True)
+class SessionSummary:
+    """A durable, bounded summary of a session's committed conversation.
+
+    Summaries are derived inside the same transaction as their source events.
+    They are therefore safe to use as model context after a worker restart and
+    never claim to cover events that were not durably committed.
+    """
+
+    tenant_id: str
+    session_id: str
+    summary_id: str
+    based_on_seq: int
+    content: str
+    content_hash: str
+    model_ref: str | None
+    created_at: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetRequest:
     budget_name: str
@@ -381,6 +400,9 @@ class CommitInput:
     reply: ReplyDraft | None = None
     actual_budget_units: Mapping[str, int] = field(default_factory=dict)
     audit_decision: str = "committed"
+    # Structured audit facts contain identifiers and hashes only—never raw
+    # provider credentials or conversation content.
+    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -388,6 +410,7 @@ class CommitResult:
     session: SessionRecord
     inbox: InboxRecord
     events: list[SessionEvent]
+    summary: SessionSummary | None
     reply_outbox: OutboxRecord | None
     memory_outboxes: list[OutboxRecord]
 
@@ -453,4 +476,17 @@ class AuditRecord:
     request_id: str
     session_id: str | None = None
     reason_code: str | None = None
+    channel: str | None = None
+    subject_id: str | None = None
+    agent_name: str | None = None
+    tool_name: str | None = None
+    policy_version: str | None = None
+    latency_ms: int | None = None
+    error_type: str | None = None
+    input_hash: str | None = None
+    output_hash: str | None = None
+    token_in: int | None = None
+    token_out: int | None = None
+    cost_micros: int | None = None
+    encrypted_detail_ref: str | None = None
     occurred_at: datetime = field(default_factory=utcnow)

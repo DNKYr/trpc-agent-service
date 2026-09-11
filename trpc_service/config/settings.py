@@ -126,6 +126,7 @@ class AppSettings:
     redis_url: str = "redis://localhost:6379/0"
     object_store_endpoint: str = "http://localhost:9000"
     object_store_bucket: str = "trpc-artifacts"
+    storage_profile_root: str = "data/storage-profiles"
     object_store_access_key: str | None = field(default=None, repr=False)
     object_store_secret_key: str | None = field(default=None, repr=False)
     admin_api_key: str | None = field(default=None, repr=False)
@@ -177,6 +178,11 @@ class AppSettings:
             ),
             object_store_bucket=configured(
                 "TRPC_SERVICE_OBJECT_STORE_BUCKET", "OBJECT_STORE_BUCKET", "trpc-artifacts"
+            ),
+            storage_profile_root=configured(
+                "TRPC_SERVICE_STORAGE_PROFILE_ROOT",
+                "TRPC_STORAGE_PROFILE_ROOT",
+                "data/storage-profiles",
             ),
             object_store_access_key=configured(
                 "TRPC_SERVICE_OBJECT_STORE_ACCESS_KEY", "OBJECT_STORE_ACCESS_KEY"

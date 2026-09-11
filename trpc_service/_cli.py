@@ -240,7 +240,12 @@ def command_worker(args: argparse.Namespace) -> int:
         _seed(services)
     while True:
         tenant_id = "demo-acme" if services.settings.runtime_backend == "memory" else None
-        _dump({"processed": asyncio.run(services.process_published(tenant_id))})
+        _dump(
+            {
+                "processed": asyncio.run(services.process_published(tenant_id)),
+                "storage_migrations": services.run_storage_migrations(),
+            }
+        )
         if args.once:
             break
         time.sleep(1)

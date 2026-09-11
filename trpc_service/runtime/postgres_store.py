@@ -9,7 +9,7 @@ one transaction with ``SET LOCAL app.tenant_id`` through :class:`PostgresConnect
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -45,6 +45,7 @@ from .models import (
     OutboxStatus,
     SessionEvent,
     SessionRecord,
+    SessionSummary,
     StorageMigration,
     StorageRoute,
     TenantContext,
@@ -68,6 +69,36 @@ def _json(value: Any) -> Any:
     from psycopg.types.json import Jsonb
 
     return Jsonb(value)
+
+
+_AUDIT_TEXT_FIELDS = {
+    "channel",
+    "subject_id",
+    "agent_name",
+    "tool_name",
+    "policy_version",
+    "reason_code",
+    "error_type",
+    "input_hash",
+    "output_hash",
+    "encrypted_detail_ref",
+}
+_AUDIT_INTEGER_FIELDS = {"latency_ms", "token_in", "token_out", "cost_micros"}
+
+
+def _audit_fields(metadata: Mapping[str, Any]) -> dict[str, object]:
+    """Whitelist hash/identifier audit fields, excluding raw input and output."""
+
+    fields: dict[str, object] = {}
+    for key in _AUDIT_TEXT_FIELDS:
+        value = metadata.get(key)
+        if isinstance(value, str):
+            fields[key] = value[:512]
+    for key in _AUDIT_INTEGER_FIELDS:
+        value = metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            fields[key] = value
+    return fields
 
 
 class PostgresRuntimeStore:
@@ -198,6 +229,19 @@ class PostgresRuntimeTransaction:
             payload=dict(row["payload"] or {}),
             trace_id=str(row["trace_id"]),
             occurred_at=row["occurred_at"],
+        )
+
+    @staticmethod
+    def _summary(row: dict[str, Any]) -> SessionSummary:
+        return SessionSummary(
+            tenant_id=str(row["tenant_id"]),
+            session_id=str(row["session_id"]),
+            summary_id=str(row["summary_id"]),
+            based_on_seq=int(row["based_on_seq"]),
+            content=str(row["content"]),
+            content_hash=str(row["content_hash"]),
+            model_ref=row["model_ref"],
+            created_at=row["created_at"],
         )
 
     @staticmethod
@@ -1021,6 +1065,59 @@ class PostgresRuntimeTransaction:
         if updated_session is None:
             raise StaleFence("session CAS update failed")
         committed_session = self._session(updated_session)
+        summary: SessionSummary | None = None
+        if events:
+            summary_rows = self.connection.execute(
+                """
+                SELECT role, payload FROM session_event
+                WHERE tenant_id = %s AND session_id = %s AND role IN ('user', 'assistant')
+                ORDER BY seq DESC LIMIT 24
+                """,
+                (self._tenant(), committed_session.session_id),
+            ).fetchall()
+            lines: list[str] = []
+            for summary_row in reversed(summary_rows):
+                text = (summary_row["payload"] or {}).get("text")
+                if isinstance(text, str) and text.strip():
+                    lines.append(f"{summary_row['role']}: {' '.join(text.split())[:800]}")
+            if lines:
+                summary_content = "\n".join(lines)[-6000:]
+                based_on_seq = events[-1].seq
+                summary_id = stable_id(
+                    "sum", committed_session.session_id, based_on_seq, content_hash(summary_content)
+                )
+                row = self.connection.execute(
+                    """
+                    INSERT INTO session_summary
+                    (tenant_id, session_id, summary_id, based_on_seq, content, content_hash, model_ref, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (tenant_id, session_id, based_on_seq) DO NOTHING
+                    RETURNING *
+                    """,
+                    (
+                        self._tenant(),
+                        committed_session.session_id,
+                        summary_id,
+                        based_on_seq,
+                        summary_content,
+                        content_hash(summary_content),
+                        (
+                            str(committed_session.state.get("model"))
+                            if isinstance(committed_session.state.get("model"), str)
+                            else None
+                        ),
+                        now,
+                    ),
+                ).fetchone()
+                if row is None:
+                    row = self.connection.execute(
+                        """
+                        SELECT * FROM session_summary
+                        WHERE tenant_id = %s AND session_id = %s AND based_on_seq = %s
+                        """,
+                        (self._tenant(), committed_session.session_id, based_on_seq),
+                    ).fetchone()
+                summary = self._summary(row)
         memory_outboxes: list[OutboxRecord] = []
         for position, draft in enumerate(commit.memories):
             memory_id = draft.memory_id or stable_id(
@@ -1138,25 +1235,44 @@ class PostgresRuntimeTransaction:
             """,
             (now, self._tenant(), claim.execution_id, claim.attempt_no),
         )
+        audit = _audit_fields(commit.audit_metadata)
         self.connection.execute(
             """
-            INSERT INTO audit_log (tenant_id, audit_id, occurred_at, session_id, decision, trace_id, request_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO audit_log
+            (tenant_id, audit_id, occurred_at, channel, subject_id, session_id, agent_name, tool_name,
+             decision, reason_code, policy_version, latency_ms, error_type, input_hash, output_hash,
+             token_in, token_out, cost_micros, trace_id, request_id, encrypted_detail_ref)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 self._tenant(),
                 stable_id("audit", claim.execution_id, committed_session.version),
                 now,
+                audit.get("channel"),
+                audit.get("subject_id"),
                 committed_session.session_id,
+                audit.get("agent_name"),
+                audit.get("tool_name"),
                 commit.audit_decision,
+                audit.get("reason_code"),
+                audit.get("policy_version"),
+                audit.get("latency_ms"),
+                audit.get("error_type"),
+                audit.get("input_hash"),
+                audit.get("output_hash"),
+                audit.get("token_in"),
+                audit.get("token_out"),
+                audit.get("cost_micros"),
                 inbox.trace_id,
                 inbox.request_id,
+                audit.get("encrypted_detail_ref"),
             ),
         )
         return CommitResult(
             session=committed_session,
             inbox=self._inbox(final_inbox),
             events=events,
+            summary=summary,
             reply_outbox=reply_outbox,
             memory_outboxes=memory_outboxes,
         )
@@ -1189,6 +1305,19 @@ class PostgresRuntimeTransaction:
                 request_id=str(row["request_id"]),
                 session_id=row["session_id"],
                 reason_code=row["reason_code"],
+                channel=row["channel"],
+                subject_id=row["subject_id"],
+                agent_name=row["agent_name"],
+                tool_name=row["tool_name"],
+                policy_version=row["policy_version"],
+                latency_ms=row["latency_ms"],
+                error_type=row["error_type"],
+                input_hash=row["input_hash"],
+                output_hash=row["output_hash"],
+                token_in=row["token_in"],
+                token_out=row["token_out"],
+                cost_micros=row["cost_micros"],
+                encrypted_detail_ref=row["encrypted_detail_ref"],
                 occurred_at=row["occurred_at"],
             )
             for row in rows
@@ -1284,6 +1413,8 @@ class PostgresRuntimeTransaction:
         if action == "start_backfill" and status == MigrationStatus.PREPARING:
             status = MigrationStatus.BACKFILLING
         elif action == "catch_up" and status == MigrationStatus.BACKFILLING:
+            status = MigrationStatus.CATCHING_UP
+        elif action == "record_catch_up" and status == MigrationStatus.CATCHING_UP:
             status = MigrationStatus.CATCHING_UP
         elif action == "begin_drain" and status == MigrationStatus.CATCHING_UP:
             status = MigrationStatus.DRAINING
@@ -1399,6 +1530,7 @@ class PostgresRuntimeTransaction:
             "outbox": ("outbox", self._outbox),
             "sessions": ("session", self._session),
             "events": ("session_event", self._event),
+            "summaries": ("session_summary", self._summary),
             "memories": ("memory", self._memory),
             "tools": ("tool_execution", self._tool),
             "migrations": ("storage_migration", self._migration),

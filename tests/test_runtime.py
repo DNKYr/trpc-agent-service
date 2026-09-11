@@ -316,6 +316,45 @@ def test_same_session_can_emit_a_reply_for_each_inbound_message():
     assert len(replies) == 2
 
 
+def test_committed_conversation_summary_and_audit_facts_are_durable():
+    _, runtime, context, _ = make_runtime()
+    inbox = runtime.accept_inbound(context, envelope("provider:summary")).inbox
+    claim = runtime.claim_execution(context, inbox.inbox_id, "worker")
+    result = runtime.commit_execution(
+        context,
+        claim,
+        CommitInput(
+            expected_session_version=0,
+            new_state={"model": "mock"},
+            events=[
+                SessionEventDraft(event_type="user.message", role="user", payload={"text": "hello"}),
+                SessionEventDraft(
+                    event_type="reply.text", role="assistant", payload={"text": "welcome"}
+                ),
+            ],
+            audit_metadata={
+                "channel": "mock",
+                "subject_id": "alice",
+                "agent_name": "agent-1",
+                "policy_version": "1",
+                "input_hash": "input-hash",
+                "output_hash": "output-hash",
+                "token_in": 3,
+                "token_out": 2,
+            },
+        ),
+    )
+
+    assert result.summary is not None
+    assert result.summary.based_on_seq == 2
+    snapshot = runtime.snapshot(context)
+    assert snapshot["summaries"][0]["content"] == "user: hello\nassistant: welcome"
+    audit = snapshot["audit"][-1]
+    assert audit["channel"] == "mock"
+    assert audit["input_hash"] == "input-hash"
+    assert audit["token_in"] == 3
+
+
 def test_migration_drains_fences_and_cutover_rejects_old_worker():
     clock, runtime, context, _ = make_runtime()
     inbox = runtime.accept_inbound(context, envelope("provider:1")).inbox

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, is_dataclass
 from hashlib import sha256
 from hmac import compare_digest
 from secrets import token_urlsafe
+from time import perf_counter
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -44,7 +45,12 @@ from trpc_service.governance import (
     PrincipalFilter,
     RateLimitFilter,
 )
-from trpc_service.metrics import bind_trace_context, configure_opentelemetry, extract_trace_context
+from trpc_service.metrics import (
+    bind_trace_context,
+    configure_opentelemetry,
+    extract_trace_context,
+    new_trace_context,
+)
 from trpc_service.runtime import (
     BudgetAccount,
     CommitInput,
@@ -53,6 +59,7 @@ from trpc_service.runtime import (
     InMemoryMessageBus,
     InMemoryRuntimeStore,
     MemoryIntentDraft,
+    MigrationStatus,
     PlatformRuntime,
     PostgresDeliveryLedger,
     PostgresRuntimeStore,
@@ -63,9 +70,11 @@ from trpc_service.runtime import (
     TenantContext,
     ToolCapability,
     ToolStatus,
+    content_hash,
     stable_id,
     to_primitive,
 )
+from trpc_service.storage import StorageMigrationError, StorageProfileRouter
 from trpc_service.tool import (
     MockSideEffectTool,
     TicketLookupTool,
@@ -118,6 +127,21 @@ def _context(tenant_id: str, request_id: str, trace_id: str, actor: str = "api")
     )
 
 
+def _trace_from_outbox_record(
+    record: Mapping[str, Any], fallback_request_id: str = "", fallback_trace_id: str = ""
+):
+    """Restore trace/request identity carried by durable outbox records."""
+
+    payload = record.get("payload")
+    request_id = (
+        str(payload.get("request_id") or "") if isinstance(payload, Mapping) else ""
+    ) or fallback_request_id
+    candidate = str(record.get("trace_id") or fallback_trace_id or "")
+    if len(candidate) == 32 and all(character in "0123456789abcdefABCDEF" for character in candidate):
+        return new_trace_context(request_id=request_id or None, trace_id=candidate.lower())
+    return new_trace_context(request_id=request_id or None)
+
+
 def _session_for_api(
     tenant_id: str, agent_id: str, session_key: str | None, subject_id: str
 ) -> str:
@@ -152,6 +176,7 @@ class ServiceContainer:
     agent_factory: AgentFactory = field(init=False)
     adapters: dict[str, Any] = field(init=False)
     tools: dict[str, Any] = field(init=False)
+    storage_profiles: StorageProfileRouter = field(init=False)
     aibot_registry: AIBotRegistry = field(init=False)
     principal_filter: PrincipalFilter = field(default_factory=PrincipalFilter)
     rate_limit_filter: RateLimitFilter = field(default_factory=RateLimitFilter)
@@ -180,6 +205,10 @@ class ServiceContainer:
             raise ValueError("TRPC_SERVICE_RUNTIME_BACKEND must be 'memory' or 'postgres'")
         self.runtime = PlatformRuntime(self.store, self.bus)
         self.agent_factory = AgentFactory(self.settings, secrets=self.secrets)
+        self.storage_profiles = StorageProfileRouter(
+            root=self.settings.storage_profile_root,
+            memory_mode=self.settings.runtime_backend == "memory",
+        )
         self.aibot_registry = AIBotRegistry()
         self.adapters = {
             "mock": self.mock_channel,
@@ -464,7 +493,9 @@ class ServiceContainer:
             raise renewal_error
         return result, current_claim
 
-    def _session_context(self, context: TenantContext, inbox: Mapping[str, Any]) -> dict[str, Any]:
+    def _session_context(
+        self, context: TenantContext, inbox: Mapping[str, Any], user_text: str
+    ) -> dict[str, Any]:
         """Load persisted session events and memory before constructing model input."""
 
         snapshot = self.runtime.snapshot(context)
@@ -483,17 +514,50 @@ class ServiceContainer:
                 or (subject_id and row.get("subject_id") == subject_id)
             )
         ][-20:]
+        summaries = sorted(
+            (
+                row
+                for row in snapshot.get("summaries", [])
+                if row.get("session_id") == session_id and isinstance(row.get("content"), str)
+            ),
+            key=lambda row: int(row.get("based_on_seq", 0)),
+        )
+        latest_summary = summaries[-1] if summaries else None
         history = [
             row
             for row in snapshot["events"]
-            if row.get("session_id") == session_id and row.get("role") in {"user", "assistant"}
+            if row.get("session_id") == session_id
+            and row.get("role") in {"user", "assistant"}
+            and (
+                latest_summary is None
+                or int(row.get("seq", 0)) > int(latest_summary.get("based_on_seq", 0))
+            )
         ][-12:]
-        summary = "\n".join(
+        recent_history = "\n".join(
             f"{row['role']}: {str(row.get('payload', {}).get('text', ''))[:1000]}"
             for row in history
             if isinstance(row.get("payload"), Mapping)
         )
-        return {"memory": memories, "summary": summary}
+        summary = "\n".join(
+            part
+            for part in (
+                str(latest_summary.get("content", "")) if latest_summary else "",
+                recent_history,
+            )
+            if part
+        )
+        knowledge: list[dict[str, Any]] = []
+        route = self.runtime.current_route(context)
+        if route is not None:
+            try:
+                knowledge = self.storage_profiles.search(
+                    context.tenant_id, route.profile, user_text, limit=8
+                )
+            except StorageMigrationError:
+                # Canonical memory remains available even if an optional
+                # retrieval profile is temporarily unavailable.
+                knowledge = []
+        return {"memory": memories, "summary": summary, "knowledge": knowledge}
 
     def _execution_tools(
         self,
@@ -634,10 +698,11 @@ class ServiceContainer:
         )
         self.rate_limit_filter.check(context.tenant_id, str(inbox.get("subject_id") or "anonymous"))
         self.input_dlp_filter.check(input_text)
+        agent_started = perf_counter()
         result, claim = await self._run_with_execution_heartbeat(
             context,
             claim,
-            agent.run(input_text, self._session_context(context, inbox)),
+            agent.run(input_text, self._session_context(context, inbox, input_text)),
         )
         self.runtime.assert_execution(context, claim)
         events = [
@@ -696,6 +761,17 @@ class ServiceContainer:
                         if result.usage["input_tokens"] > 0 and result.usage["output_tokens"] > 0
                         else budget_estimates["model_tokens"]
                     )
+                },
+                audit_metadata={
+                    "channel": str(inbox["payload"].get("channel") or ""),
+                    "subject_id": str(inbox.get("subject_id") or ""),
+                    "agent_name": release.agent_id,
+                    "policy_version": str(release.config_version),
+                    "latency_ms": max(0, round((perf_counter() - agent_started) * 1000)),
+                    "input_hash": content_hash(input_text),
+                    "output_hash": content_hash(reply),
+                    "token_in": result.usage["input_tokens"],
+                    "token_out": result.usage["output_tokens"],
                 },
             ),
         )
@@ -762,6 +838,92 @@ class ServiceContainer:
             published[tenant_id] = self.dispatch(tenant_id, request_id, trace_id)
         return published
 
+    def _project_active_storage(self, context: TenantContext) -> str | None:
+        """Refresh the selected retrieval profile from canonical runtime facts."""
+
+        route = self.runtime.current_route(context)
+        if route is None:
+            return None
+        return self.storage_profiles.copy(
+            context.tenant_id, route.profile, self.runtime.snapshot(context)
+        )
+
+    def run_storage_migrations(self) -> list[dict[str, Any]]:
+        """Run one real backfill/catch-up/verification pass per tenant.
+
+        This method belongs in the worker process, which has the tenant-scoped
+        grants needed to read canonical session/memory records.  The admin API
+        can request a state transition but cannot assert verification itself.
+        """
+
+        outcomes: list[dict[str, Any]] = []
+        for tenant_id in self.control.tenant_ids():
+            context = _context(tenant_id, "storage-migration", "", actor="storage-worker")
+            snapshot = self.runtime.snapshot(context)
+            for row in snapshot["migrations"]:
+                migration_id = str(row["migration_id"])
+                state = MigrationStatus(str(row["status"]))
+                target_profile = row["target_profile"]
+                if not isinstance(target_profile, Mapping):
+                    continue
+                try:
+                    if state in {MigrationStatus.BACKFILLING, MigrationStatus.CATCHING_UP}:
+                        self.storage_profiles.copy(tenant_id, target_profile, snapshot)
+                        _, source_watermark, target_watermark = self.storage_profiles.verify(
+                            tenant_id, target_profile, snapshot
+                        )
+                        action = "catch_up" if state == MigrationStatus.BACKFILLING else "record_catch_up"
+                        updated = self.runtime.migration_action(
+                            context,
+                            migration_id,
+                            action,
+                            source_watermark=source_watermark,
+                            target_watermark=target_watermark,
+                        )
+                        outcomes.append(
+                            {
+                                "tenant_id": tenant_id,
+                                "migration_id": migration_id,
+                                "status": updated.status.value,
+                                "source_watermark": source_watermark,
+                                "target_watermark": target_watermark,
+                            }
+                        )
+                    elif state == MigrationStatus.DRAINING:
+                        verified, source_watermark, target_watermark = self.storage_profiles.verify(
+                            tenant_id, target_profile, snapshot
+                        )
+                        updated = self.runtime.migration_action(
+                            context,
+                            migration_id,
+                            "verify",
+                            source_watermark=source_watermark,
+                            target_watermark=target_watermark,
+                            verified=verified,
+                        )
+                        outcomes.append(
+                            {
+                                "tenant_id": tenant_id,
+                                "migration_id": migration_id,
+                                "status": updated.status.value,
+                                "verified": verified,
+                            }
+                        )
+                except StorageMigrationError as exc:
+                    outcomes.append(
+                        {
+                            "tenant_id": tenant_id,
+                            "migration_id": migration_id,
+                            "status": "retryable_error",
+                            "error": type(exc).__name__,
+                        }
+                    )
+                except RuntimeErrorBase:
+                    # A draining tenant may still hold a live fenced execution;
+                    # leave the migration in place and retry next worker pass.
+                    continue
+        return outcomes
+
     async def process_published(
         self, tenant_id: str | None = None, request_id: str = "", trace_id: str = ""
     ) -> list[dict[str, Any]]:
@@ -775,16 +937,34 @@ class ServiceContainer:
                 event_type = str(record.get("event_type", ""))
                 record_tenant = str(record.get("tenant_id", ""))
                 try:
-                    if event_type == "inbound.dispatch" and record_tenant:
-                        inbox_id = str(
-                            record.get("inbox_id") or record.get("payload", {}).get("inbox_id", "")
-                        )
-                        if inbox_id:
-                            outputs.append(
-                                await self.execute_inbox(
-                                    _context(record_tenant, request_id, trace_id, actor="worker"),
-                                    inbox_id,
-                                    self.settings.worker_id,
+                    record_trace = _trace_from_outbox_record(record, request_id, trace_id)
+                    with bind_trace_context(record_trace):
+                        if event_type == "inbound.dispatch" and record_tenant:
+                            payload = record.get("payload")
+                            inbox_id = str(
+                                record.get("inbox_id")
+                                or (payload.get("inbox_id", "") if isinstance(payload, Mapping) else "")
+                            )
+                            if inbox_id:
+                                outputs.append(
+                                    await self.execute_inbox(
+                                        _context(
+                                            record_tenant,
+                                            record_trace.request_id,
+                                            record_trace.trace_id,
+                                            actor="worker",
+                                        ),
+                                        inbox_id,
+                                        self.settings.worker_id,
+                                    )
+                                )
+                        elif event_type == "memory.project" and record_tenant:
+                            self._project_active_storage(
+                                _context(
+                                    record_tenant,
+                                    record_trace.request_id,
+                                    record_trace.trace_id,
+                                    actor="storage-worker",
                                 )
                             )
                     self.bus.acknowledge(group, message_id)
@@ -795,15 +975,38 @@ class ServiceContainer:
             return outputs
         if tenant_id is None:
             raise ValueError("memory worker requires an explicit tenant_id")
-        context = _context(tenant_id, request_id, trace_id, actor="worker")
         for _, event in list(self.bus.published):
             if event.tenant_id != tenant_id or event.outbox_id in self.processed_bus_events:
                 continue
             self.processed_bus_events.add(event.outbox_id)
             if event.event_type == "inbound.dispatch" and event.inbox_id:
-                outputs.append(
-                    await self.execute_inbox(context, event.inbox_id, self.settings.worker_id)
+                record_trace = _trace_from_outbox_record(
+                    to_primitive(event), request_id, trace_id
                 )
+                with bind_trace_context(record_trace):
+                    outputs.append(
+                        await self.execute_inbox(
+                            _context(
+                                tenant_id,
+                                record_trace.request_id,
+                                record_trace.trace_id,
+                                actor="worker",
+                            ),
+                            event.inbox_id,
+                            self.settings.worker_id,
+                        )
+                    )
+            elif event.event_type == "memory.project":
+                record_trace = _trace_from_outbox_record(to_primitive(event), request_id, trace_id)
+                with bind_trace_context(record_trace):
+                    self._project_active_storage(
+                        _context(
+                            tenant_id,
+                            record_trace.request_id,
+                            record_trace.trace_id,
+                            actor="storage-worker",
+                        )
+                    )
         return outputs
 
     async def deliver_mock_replies(
@@ -986,8 +1189,10 @@ class ServiceContainer:
         for outbox in snapshot["outbox"]:
             if outbox["event_type"] != "reply.dispatch" or outbox["status"] != "published":
                 continue
-            outcome, _ = await self._deliver_outbox(outbox, provider_filter=provider_filter)
-            outcomes.append(outcome)
+            record_trace = _trace_from_outbox_record(outbox, request_id, trace_id)
+            with bind_trace_context(record_trace):
+                outcome, _ = await self._deliver_outbox(outbox, provider_filter=provider_filter)
+                outcomes.append(outcome)
         return outcomes
 
     async def process_delivery_published(
@@ -1018,10 +1223,12 @@ class ServiceContainer:
                 self.bus.acknowledge(group, message_id)
                 continue
             try:
-                outcome, final = await self._deliver_outbox(record, provider_filter=provider_filter)
-                outcomes.append(outcome)
-                if final:
-                    self.bus.acknowledge(group, message_id)
+                record_trace = _trace_from_outbox_record(record, request_id, trace_id)
+                with bind_trace_context(record_trace):
+                    outcome, final = await self._deliver_outbox(record, provider_filter=provider_filter)
+                    outcomes.append(outcome)
+                    if final:
+                        self.bus.acknowledge(group, message_id)
             except Exception:
                 # The entry stays pending for a leased retry.  The SQL attempt
                 # ledger is written before any provider call when possible.
@@ -1276,9 +1483,25 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         services: ServiceContainer = Depends(get_services),
     ) -> dict[str, Any]:
         trace = extract_trace_context(request.headers)
+        context = _context(tenant_id, trace.request_id, trace.trace_id, actor="admin")
+        route = services.runtime.current_route(context)
+        if route is None:
+            raise HTTPException(status_code=404, detail={"code": "storage_route_not_found"})
+        if str(route.profile.get("profile") or "") != body.source_profile:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "source_profile_mismatch", "current_profile": route.profile},
+            )
+        try:
+            # Validate profile naming before a state record is created.  The
+            # worker owns the actual copy, but it must be able to resolve this
+            # same target after a restart.
+            services.storage_profiles.adapter({"profile": body.target_profile})
+        except StorageMigrationError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_storage_profile"}) from exc
         return _json(
             services.runtime.initiate_migration(
-                _context(tenant_id, trace.request_id, trace.trace_id),
+                context,
                 {"profile": body.target_profile},
                 migration_id=stable_id("mig", tenant_id, body.source_profile, body.target_profile),
             )
@@ -1316,6 +1539,14 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         context = _context(tenant_id, trace.request_id, trace.trace_id)
         if body.action == "prepare":
             return _json(services.runtime.get_migration(context, migration_id))
+        if body.action == "backfill":
+            return _json(
+                services.runtime.migration_action(context, migration_id, "start_backfill")
+            )
+        if body.action in {"catch_up", "verify"}:
+            # The worker calculates copy watermarks and verification from the
+            # target adapter.  API callers cannot submit their own proof.
+            return _json(services.runtime.get_migration(context, migration_id))
         if body.action == "rollback":
             migration = services.runtime.get_migration(context, migration_id)
             runtime_action = (
@@ -1323,10 +1554,7 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
             )
         else:
             runtime_action = {
-                "backfill": "start_backfill",
-                "catch_up": "catch_up",
                 "drain": "begin_drain",
-                "verify": "verify",
                 "cutover": "cutover",
                 "cancel": "cancel",
             }[body.action]
@@ -1335,9 +1563,6 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
                 context,
                 migration_id,
                 runtime_action,
-                source_watermark=body.source_watermark,
-                target_watermark=body.target_watermark,
-                verified=body.verified,
             )
         )
 

@@ -108,17 +108,47 @@ def bind_trace_context(context: TraceContext) -> Iterator[TraceContext]:
 def traced(
     name: str, *, logger: logging.Logger | None = None, **attributes: object
 ) -> Iterator[TraceContext]:
-    """Emit a small span-shaped structured log and preserve context across layers."""
+    """Create a real OTEL span when configured and retain a safe log fallback."""
 
     parent = current_trace_context()
     context = TraceContext(
         parent.trace_id, secrets.token_hex(8), parent.request_id, parent.trace_flags
     )
     started = time.perf_counter()
-    with bind_trace_context(context):
+    span_context = contextlib.nullcontext(None)
+    try:
+        from opentelemetry import trace
+        from opentelemetry.trace import (
+            NonRecordingSpan,
+            SpanContext,
+            TraceFlags,
+            set_span_in_context,
+        )
+
+        parent_span = SpanContext(
+            trace_id=int(parent.trace_id, 16),
+            span_id=int(parent.span_id, 16),
+            is_remote=True,
+            trace_flags=TraceFlags(int(parent.trace_flags, 16)),
+        )
+        otel_parent = set_span_in_context(NonRecordingSpan(parent_span))
+        span_context = trace.get_tracer("trpc_service").start_as_current_span(name, context=otel_parent)
+    except (ImportError, ValueError):
+        # A dependency-free local run still receives the structured trace
+        # context and log timing below.
+        pass
+    with span_context as span, bind_trace_context(context):
+        if span is not None:
+            for key, value in attributes.items():
+                if isinstance(value, (str, bool, int, float)):
+                    span.set_attribute(str(key), value)
+            span.set_attribute("trpc.request_id", context.request_id)
         try:
             yield context
         except Exception as exc:
+            if span is not None:
+                span.record_exception(exc)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, type(exc).__name__))
             if logger:
                 logger.exception(
                     "span_failed",
