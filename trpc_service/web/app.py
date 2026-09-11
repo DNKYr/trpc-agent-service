@@ -1491,6 +1491,3 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         return _json(resolved)
 
     return app
-
-
-app = create_app()
