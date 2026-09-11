@@ -1522,7 +1522,7 @@ class PostgresRuntimeTransaction:
         ).fetchone()
         return self._migration(updated)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_audit: bool = True) -> dict[str, Any]:
         tenant_id = self._tenant()
         state = to_primitive(self.runtime_state())
         tables = {
@@ -1541,7 +1541,7 @@ class PostgresRuntimeTransaction:
                 f"SELECT * FROM {table} WHERE tenant_id = %s", (tenant_id,)
             ).fetchall()
             output[name] = [to_primitive(mapper(row)) for row in rows]
-        output["audit"] = [to_primitive(row) for row in self.list_audit()]
+        output["audit"] = [to_primitive(row) for row in self.list_audit()] if include_audit else []
         return output
 
     def _reserve_budgets(

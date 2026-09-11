@@ -238,11 +238,11 @@ class PlatformRuntime:
         with self.store.transaction(context) as tx:
             return tx.current_route()
 
-    def snapshot(self, context: TenantContext) -> dict[str, Any]:
+    def snapshot(self, context: TenantContext, *, include_audit: bool = True) -> dict[str, Any]:
         """Demo/debug helper; never use as a cross-tenant admin query."""
 
         with self.store.transaction(context) as tx:
-            return tx.snapshot()
+            return tx.snapshot(include_audit=include_audit)
 
     def mark_outbox_delivered(self, context: TenantContext, outbox_id: str) -> None:
         with self.store.transaction(context) as tx:

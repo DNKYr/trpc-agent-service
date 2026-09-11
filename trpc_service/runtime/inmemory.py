@@ -986,7 +986,7 @@ class InMemoryRuntimeTransaction:
         migration.updated_at = now
         return deepcopy(migration)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_audit: bool = True) -> dict[str, Any]:
         tenant_id = self._tenant()
         return {
             "runtime_state": to_primitive(self._store._data.states[tenant_id]),
@@ -1027,7 +1027,11 @@ class InMemoryRuntimeTransaction:
                 for (row_tenant, _), value in self._store._data.tools.items()
                 if row_tenant == tenant_id
             ],
-            "audit": [to_primitive(value) for value in self._store._data.audits.get(tenant_id, [])],
+            "audit": (
+                [to_primitive(value) for value in self._store._data.audits.get(tenant_id, [])]
+                if include_audit
+                else []
+            ),
             "migrations": [
                 to_primitive(value)
                 for (row_tenant, _), value in self._store._data.migrations.items()

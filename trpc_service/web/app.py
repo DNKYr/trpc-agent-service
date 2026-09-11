@@ -498,7 +498,7 @@ class ServiceContainer:
     ) -> dict[str, Any]:
         """Load persisted session events and memory before constructing model input."""
 
-        snapshot = self.runtime.snapshot(context)
+        snapshot = self.runtime.snapshot(context, include_audit=False)
         session_id = str(inbox["session_id"])
         subject_id = str(inbox.get("subject_id") or "")
         memories = [
@@ -651,7 +651,7 @@ class ServiceContainer:
     ) -> dict[str, Any]:
         """Run a claimed Inbox using its immutable release and atomically commit output."""
 
-        snapshot = self.runtime.snapshot(context)
+        snapshot = self.runtime.snapshot(context, include_audit=False)
         inbox = next((row for row in snapshot["inboxes"] if row["inbox_id"] == inbox_id), None)
         if inbox is None:
             raise KeyError("inbox does not exist")
@@ -845,7 +845,7 @@ class ServiceContainer:
         if route is None:
             return None
         return self.storage_profiles.copy(
-            context.tenant_id, route.profile, self.runtime.snapshot(context)
+            context.tenant_id, route.profile, self.runtime.snapshot(context, include_audit=False)
         )
 
     def run_storage_migrations(self) -> list[dict[str, Any]]:
@@ -859,7 +859,7 @@ class ServiceContainer:
         outcomes: list[dict[str, Any]] = []
         for tenant_id in self.control.tenant_ids():
             context = _context(tenant_id, "storage-migration", "", actor="storage-worker")
-            snapshot = self.runtime.snapshot(context)
+            snapshot = self.runtime.snapshot(context, include_audit=False)
             for row in snapshot["migrations"]:
                 migration_id = str(row["migration_id"])
                 state = MigrationStatus(str(row["status"]))
@@ -1184,7 +1184,7 @@ class ServiceContainer:
         """Deliver currently published replies for one tenant (memory/demo path)."""
 
         context = _context(tenant_id, request_id, trace_id, actor="dispatcher")
-        snapshot = self.runtime.snapshot(context)
+        snapshot = self.runtime.snapshot(context, include_audit=False)
         outcomes: list[dict[str, Any]] = []
         for outbox in snapshot["outbox"]:
             if outbox["event_type"] != "reply.dispatch" or outbox["status"] != "published":
@@ -1631,7 +1631,9 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         services: ServiceContainer = Depends(get_services),
     ) -> dict[str, Any]:
         trace = extract_trace_context(request.headers)
-        snapshot = services.runtime.snapshot(_context(tenant_id, trace.request_id, trace.trace_id))
+        snapshot = services.runtime.snapshot(
+            _context(tenant_id, trace.request_id, trace.trace_id), include_audit=False
+        )
         items = [row for row in snapshot["inboxes"] if row["request_id"] == request_id]
         replies = {
             str(event["payload"].get("inbox_id")): str(event["payload"].get("text", ""))
@@ -1663,7 +1665,9 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         tenant_id: str, request: Request, services: ServiceContainer = Depends(get_services)
     ) -> Page:
         trace = extract_trace_context(request.headers)
-        snapshot = services.runtime.snapshot(_context(tenant_id, trace.request_id, trace.trace_id))
+        snapshot = services.runtime.snapshot(
+            _context(tenant_id, trace.request_id, trace.trace_id), include_audit=False
+        )
         tools = [row for row in snapshot["tools"] if row["status"] in {"unknown", "manual_review"}]
         deliveries = [_json(row) for row in services.delivery_ledger.unknown(tenant_id)]
         return Page(items=tools + deliveries)
@@ -1682,7 +1686,9 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
         # A human resolution is auditable and explicit.  It never silently retries a
         # non-idempotent provider operation; retry is merely recorded for an admin.
         trace = extract_trace_context(request.headers)
-        snapshot = services.runtime.snapshot(_context(tenant_id, trace.request_id, trace.trace_id))
+        snapshot = services.runtime.snapshot(
+            _context(tenant_id, trace.request_id, trace.trace_id), include_audit=False
+        )
         known = next(
             (row for row in snapshot["tools"] if row["tool_call_id"] == operation_id), None
         )
