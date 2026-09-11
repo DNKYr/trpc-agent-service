@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Apply the workload-login setup to an existing Compose PostgreSQL volume.
-# It only creates/updates the named roles and grants; it never changes tables or
-# deletes data.  The postgres service must have been started with
+# It creates/updates the named roles and grants and transfers ownership of
+# bootstrap-owned schema objects to platform_schema_owner; it never deletes or
+# rewrites tenant data.  The postgres service must have been started with
 # .db-bootstrap.env available to it.
 set -euo pipefail
 

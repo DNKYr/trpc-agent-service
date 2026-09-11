@@ -14,6 +14,7 @@ export PGPASSWORD="${TRPC_DB_BOOTSTRAP_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_P
 bootstrap_user="${TRPC_DB_BOOTSTRAP_USER:-${POSTGRES_USER:-postgres}}"
 
 psql --set=ON_ERROR_STOP=1 --username "$bootstrap_user" --dbname "$POSTGRES_DB" \
+  --set=bootstrap_role="$bootstrap_user" \
   --set=api_password="$TRPC_DB_API_PASSWORD" \
   --set=worker_password="$TRPC_DB_WORKER_PASSWORD" \
   --set=dispatcher_password="$TRPC_DB_DISPATCHER_PASSWORD" \
@@ -42,6 +43,17 @@ BEGIN
     END LOOP;
 END
 $roles$;
+
+-- A legacy Compose deployment created its tables as the ``trpc`` bootstrap
+-- superuser.  A NOINHERIT migrator that SET ROLEs to platform_schema_owner
+-- cannot even read alembic_version until ownership is moved.  This is an
+-- ownership-only transition: it neither copies nor deletes tenant data.  It
+-- is conditional so a fresh cluster (whose bootstrap role may be postgres)
+-- remains idempotent.
+SELECT format('REASSIGN OWNED BY %I TO platform_schema_owner', :'bootstrap_role')
+WHERE :'bootstrap_role' <> 'platform_schema_owner'
+  AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'bootstrap_role')
+\gexec
 
 GRANT agent_admin, agent_gateway TO agent_api_gateway;
 GRANT agent_gateway, agent_dispatcher TO agent_wecom_aibot;
