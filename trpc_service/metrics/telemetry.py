@@ -19,6 +19,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 _TRACE_CONTEXT: contextvars.ContextVar[TraceContext | None] = contextvars.ContextVar(
     "trpc_trace_context", default=None
@@ -313,8 +314,18 @@ def configure_opentelemetry(
 
     provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
     if otlp_endpoint:
+        # ``OTEL_EXPORTER_OTLP_ENDPOINT`` conventionally accepts an HTTP URL,
+        # while the gRPC exporter requires a host:port target.  Supporting
+        # both forms keeps local Compose and a standard OTEL deployment from
+        # silently retrying against an invalid target.
+        parsed_endpoint = urlsplit(otlp_endpoint)
+        exporter_endpoint = (
+            parsed_endpoint.netloc
+            if parsed_endpoint.scheme in {"http", "https"} and parsed_endpoint.netloc
+            else otlp_endpoint
+        )
         provider.add_span_processor(
-            BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True))
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=exporter_endpoint, insecure=True))
         )
     else:
         provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))

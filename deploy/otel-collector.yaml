@@ -1,8 +1,13 @@
 receivers:
   otlp:
     protocols:
-      grpc: {}
-      http: {}
+      # The collector runs in its own container/Pod. Binding to the default
+      # loopback listener would make it healthy while rejecting every other
+      # platform workload's OTLP export.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
 processors:
   batch: {}
 exporters:
