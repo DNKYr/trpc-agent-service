@@ -15,6 +15,7 @@ from .factory import (
     Part,
     Runner,
     RunnerEvent,
+    TrpcAgentSdkRunner,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "Part",
     "Runner",
     "RunnerEvent",
+    "TrpcAgentSdkRunner",
 ]

@@ -362,7 +362,27 @@ class ServiceContainer:
         binding = self.control.resolve_callback_binding(provider, binding_key)
         adapter = self.adapters[provider]
         adapter_binding = self.adapter_binding(binding)
-        envelope = await adapter.validate_and_normalize(adapter_binding, request)
+        try:
+            envelope = await adapter.validate_and_normalize(adapter_binding, request)
+        except ChannelError as exc:
+            # The locator has already resolved a tenant-owned binding, so this
+            # rejection is a durable compliance fact without retaining the raw
+            # callback body or credentials.
+            context = _context(
+                binding.tenant_id, request_id, trace_id, actor=f"callback:{binding.provider}"
+            )
+            self._record_audit(
+                context,
+                "channel_denied",
+                f"{binding.binding_id}:{request_id}",
+                metadata={
+                    "channel": binding.provider,
+                    "agent_name": binding.agent_id,
+                    "reason_code": exc.code,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
         return self.accept_channel_envelope(adapter_binding, envelope, request_id, trace_id)
 
     def accept_channel_envelope(
@@ -412,7 +432,26 @@ class ServiceContainer:
         """Accept a verified WebSocket frame without exposing an HTTP callback route."""
 
         adapter = self.adapters["wecom_aibot"]
-        envelope = await adapter.validate_and_normalize(binding, request)
+        try:
+            envelope = await adapter.validate_and_normalize(binding, request)
+        except ChannelError as exc:
+            self._record_audit(
+                _context(
+                    binding.tenant_id,
+                    f"aibot-denied-{binding.binding_id}",
+                    "",
+                    actor="aibot-gateway",
+                ),
+                "channel_denied",
+                f"{binding.binding_id}:aibot-validation",
+                metadata={
+                    "channel": binding.provider,
+                    "agent_name": binding.agent_id,
+                    "reason_code": exc.code,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
         trace_id = envelope.traceparent.split("-")[1] if "-" in envelope.traceparent else ""
         self.accept_channel_envelope(
             binding,
@@ -452,6 +491,82 @@ class ServiceContainer:
         if failures:
             return False, failures
         return True, {"runtime_backend": self.settings.runtime_backend}
+
+    def _record_audit(
+        self,
+        context: TenantContext,
+        decision: str,
+        source_id: str,
+        *,
+        session_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Write a deterministic, redacted audit fact for a non-commit outcome."""
+
+        self.runtime.record_audit(
+            context,
+            decision,
+            stable_id("audit", context.tenant_id, decision, source_id),
+            session_id=session_id,
+            metadata=metadata,
+        )
+
+    def _record_execution_failure(
+        self, context: TenantContext, inbox_id: str, error: Exception
+    ) -> None:
+        """Capture one safe failure fact before leaving an Inbox event pending."""
+
+        snapshot = self.runtime.snapshot(context, include_audit=False)
+        inbox = next((row for row in snapshot["inboxes"] if row["inbox_id"] == inbox_id), None)
+        if inbox is None:
+            return
+        payload = inbox.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        input_text = str(payload.get("text") or "")
+        self._record_audit(
+            context,
+            "execution_failed",
+            inbox_id,
+            session_id=str(inbox.get("session_id") or "") or None,
+            metadata={
+                "channel": str(payload.get("channel") or ""),
+                "subject_id": str(inbox.get("subject_id") or ""),
+                "agent_name": str(inbox.get("agent_id") or ""),
+                "policy_version": str(inbox.get("config_version") or ""),
+                "reason_code": type(error).__name__,
+                "error_type": type(error).__name__,
+                "input_hash": content_hash(input_text),
+            },
+        )
+
+    def _record_delivery_outcome(
+        self, record: Mapping[str, Any], binding: Binding, attempt: Any
+    ) -> None:
+        """Audit a concrete provider outcome, including manual/reconciling states."""
+
+        tenant_id = str(record["tenant_id"])
+        context = _context(
+            tenant_id,
+            "delivery-audit",
+            str(getattr(attempt, "trace_id", "") or record.get("trace_id") or ""),
+            actor="dispatcher",
+        )
+        self._record_audit(
+            context,
+            f"delivery_{str(attempt.status)}",
+            f"{attempt.delivery_id}:{attempt.attempt_no}",
+            session_id=str(attempt.session_id) or None,
+            metadata={
+                "channel": binding.provider,
+                "agent_name": binding.agent_id,
+                "reason_code": str(attempt.error_code or ""),
+                "error_type": (
+                    "delivery_provider_failure"
+                    if str(attempt.status) not in {"accepted"}
+                    else ""
+                ),
+            },
+        )
 
     async def _run_with_execution_heartbeat(
         self,
@@ -936,8 +1051,9 @@ class ServiceContainer:
             for message_id, record in messages:
                 event_type = str(record.get("event_type", ""))
                 record_tenant = str(record.get("tenant_id", ""))
+                inbox_id = ""
+                record_trace = _trace_from_outbox_record(record, request_id, trace_id)
                 try:
-                    record_trace = _trace_from_outbox_record(record, request_id, trace_id)
                     with bind_trace_context(record_trace):
                         if event_type == "inbound.dispatch" and record_tenant:
                             payload = record.get("payload")
@@ -968,9 +1084,17 @@ class ServiceContainer:
                                 )
                             )
                     self.bus.acknowledge(group, message_id)
-                except Exception:
+                except Exception as exc:
                     # Leave the Stream entry pending.  Redis will make it
                     # reclaimable; SQL Inbox/fence state suppresses re-effects.
+                    if event_type == "inbound.dispatch" and record_tenant and inbox_id:
+                        failure_context = _context(
+                            record_tenant,
+                            record_trace.request_id,
+                            record_trace.trace_id,
+                            actor="worker",
+                        )
+                        self._record_execution_failure(failure_context, inbox_id, exc)
                     continue
             return outputs
         if tenant_id is None:
@@ -978,24 +1102,28 @@ class ServiceContainer:
         for _, event in list(self.bus.published):
             if event.tenant_id != tenant_id or event.outbox_id in self.processed_bus_events:
                 continue
-            self.processed_bus_events.add(event.outbox_id)
             if event.event_type == "inbound.dispatch" and event.inbox_id:
                 record_trace = _trace_from_outbox_record(
                     to_primitive(event), request_id, trace_id
                 )
                 with bind_trace_context(record_trace):
-                    outputs.append(
-                        await self.execute_inbox(
-                            _context(
-                                tenant_id,
-                                record_trace.request_id,
-                                record_trace.trace_id,
-                                actor="worker",
-                            ),
-                            event.inbox_id,
-                            self.settings.worker_id,
-                        )
+                    execution_context = _context(
+                        tenant_id,
+                        record_trace.request_id,
+                        record_trace.trace_id,
+                        actor="worker",
                     )
+                    try:
+                        outputs.append(
+                            await self.execute_inbox(
+                                execution_context,
+                                event.inbox_id,
+                                self.settings.worker_id,
+                            )
+                        )
+                    except Exception as exc:
+                        self._record_execution_failure(execution_context, event.inbox_id, exc)
+                        continue
             elif event.event_type == "memory.project":
                 record_trace = _trace_from_outbox_record(to_primitive(event), request_id, trace_id)
                 with bind_trace_context(record_trace):
@@ -1007,6 +1135,7 @@ class ServiceContainer:
                             actor="storage-worker",
                         )
                     )
+            self.processed_bus_events.add(event.outbox_id)
         return outputs
 
     async def deliver_mock_replies(
@@ -1090,6 +1219,7 @@ class ServiceContainer:
                 self.runtime.mark_outbox_delivered(
                     _context(tenant_id, "delivery-recovery", attempt.trace_id, actor="dispatcher"), outbox_id
                 )
+                self._record_delivery_outcome(record, binding, attempt)
                 return _json(attempt), True
             if capability == "queryable":
                 reconcile = getattr(adapter, "reconcile_delivery", None)
@@ -1099,6 +1229,7 @@ class ServiceContainer:
                         status="manual_review",
                         error_code="queryable_adapter_has_no_reconciliation_operation",
                     )
+                    self._record_delivery_outcome(record, binding, final)
                     return _json(final), True
                 try:
                     reconciled = await reconcile(
@@ -1113,6 +1244,7 @@ class ServiceContainer:
                         status="reconciling",
                         error_code=f"reconciliation_{type(exc).__name__}",
                     )
+                    self._record_delivery_outcome(record, binding, final)
                     return _json(final), False
                 if reconciled is None or reconciled.status == "reconciling":
                     final = self.delivery_ledger.finish(
@@ -1120,6 +1252,7 @@ class ServiceContainer:
                         status="reconciling",
                         error_code=(reconciled.error_code if reconciled else "reconciliation_inconclusive"),
                     )
+                    self._record_delivery_outcome(record, binding, final)
                     return _json(final), False
                 if reconciled.status == "accepted":
                     final = self.delivery_ledger.finish(
@@ -1131,13 +1264,16 @@ class ServiceContainer:
                         _context(tenant_id, "delivery-reconciled", final.trace_id, actor="dispatcher"),
                         outbox_id,
                     )
+                    self._record_delivery_outcome(record, binding, final)
                     return _json(final), True
                 final = self.delivery_ledger.finish(
                     attempt,
                     status="manual_review",
                     error_code=reconciled.error_code or "reconciliation_rejected",
                 )
+                self._record_delivery_outcome(record, binding, final)
                 return _json(final), True
+            self._record_delivery_outcome(record, binding, attempt)
             return _json(attempt), True
         try:
             result = await adapter.deliver(self.adapter_binding(binding), reply)
@@ -1163,14 +1299,18 @@ class ServiceContainer:
             self.runtime.mark_outbox_delivered(
                 _context(tenant_id, "delivery", final.trace_id, actor="dispatcher"), outbox_id
             )
+            self._record_delivery_outcome(record, binding, final)
             return _json(final), True
         # Only a provider with a deterministic idempotency key may be resent
         # automatically. Queryable providers stay pending for their actual
         # reconciliation operation; non-retriable providers require a human.
         if capability == "idempotent" and final.status == "failed":
+            self._record_delivery_outcome(record, binding, final)
             return _json(final), False
         if capability == "queryable" and final.status in {"failed", "unknown", "reconciling"}:
+            self._record_delivery_outcome(record, binding, final)
             return _json(final), False
+        self._record_delivery_outcome(record, binding, final)
         return _json(final), True
 
     async def deliver_replies(
@@ -1702,6 +1842,16 @@ def create_app(container: ServiceContainer | None = None) -> FastAPI:
                         _context(tenant_id, trace.request_id, trace.trace_id, actor="admin"),
                         resolved.outbox_id,
                     )
+                services._record_audit(
+                    _context(tenant_id, trace.request_id, trace.trace_id, actor="admin"),
+                    "delivery_manual_resolution",
+                    f"{resolved.delivery_id}:{resolved.attempt_no}:{body.action}",
+                    session_id=resolved.session_id,
+                    metadata={
+                        "reason_code": body.action,
+                        "error_type": str(resolved.error_code or ""),
+                    },
+                )
                 return _json(resolved)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail={"code": "not_found"}) from exc

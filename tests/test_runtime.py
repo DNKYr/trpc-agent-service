@@ -355,6 +355,37 @@ def test_committed_conversation_summary_and_audit_facts_are_durable():
     assert audit["token_in"] == 3
 
 
+def test_non_commit_audit_facts_are_redacted_tenant_scoped_and_idempotent():
+    _, runtime, context, _ = make_runtime()
+    first = runtime.record_audit(
+        context,
+        "execution_failed",
+        "audit-execution-1",
+        session_id="session-1",
+        metadata={
+            "channel": "mock",
+            "reason_code": "RuntimeError",
+            "error_type": "RuntimeError",
+            "input_hash": "safe-hash",
+            "raw_input": "must never persist",
+        },
+    )
+    duplicate = runtime.record_audit(
+        context,
+        "execution_failed",
+        "audit-execution-1",
+        session_id="session-1",
+        metadata={"raw_input": "different secret"},
+    )
+
+    assert duplicate.audit_id == first.audit_id
+    audit = runtime.snapshot(context)["audit"]
+    assert len(audit) == 1
+    assert audit[0]["channel"] == "mock"
+    assert audit[0]["input_hash"] == "safe-hash"
+    assert "raw_input" not in audit[0]
+
+
 def test_migration_drains_fences_and_cutover_rejects_old_worker():
     clock, runtime, context, _ = make_runtime()
     inbox = runtime.accept_inbound(context, envelope("provider:1")).inbox

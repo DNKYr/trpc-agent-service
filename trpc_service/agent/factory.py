@@ -420,10 +420,204 @@ class Runner:
         )
 
 
+class TrpcAgentSdkRunner:
+    """Run real tRPC-Agent SDK ``LlmAgent`` objects behind the platform boundary.
+
+    The SDK owns model orchestration and native function-call execution.  The
+    platform still owns the durable session, memory, Tool ledger, audit facts,
+    and budget/fence boundary, so an SDK in-memory session can never become a
+    second source of truth.
+    """
+
+    def __init__(
+        self,
+        release: ImmutableRelease,
+        *,
+        api_key: str,
+        base_url: str,
+        model_name: str,
+        tools: Sequence[FunctionTool],
+    ) -> None:
+        self.release = release
+        self._api_key = api_key
+        self._base_url = base_url
+        self._model_name = model_name
+        self._tools = tuple(tools)
+
+    def _sdk_tools(self) -> list[Any]:
+        """Adapt platform Tool handlers without bypassing their durable ledger."""
+
+        from trpc_agent_sdk.tools import BaseTool
+        from trpc_agent_sdk.types import FunctionDeclaration
+
+        sdk_tools: list[Any] = []
+        for platform_tool in self._tools:
+
+            class LedgerTool(BaseTool):
+                def __init__(self, local_tool: FunctionTool) -> None:
+                    super().__init__(name=local_tool.name, description=local_tool.description)
+                    self._local_tool = local_tool
+
+                def _get_declaration(self) -> Any:
+                    # ``parameters_json_schema`` preserves the published
+                    # platform contract (including dotted Tool names) verbatim.
+                    return FunctionDeclaration(
+                        name=self.name,
+                        description=self.description,
+                        parameters_json_schema=dict(self._local_tool.parameters),
+                    )
+
+                async def _run_async_impl(self, *, tool_context: Any, args: dict[str, Any]) -> Any:
+                    del tool_context
+                    return await self._local_tool.handler(dict(args))
+
+            sdk_tools.append(LedgerTool(platform_tool))
+        return sdk_tools
+
+    def _runner(self, context: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
+        """Create an SDK execution with intentionally ephemeral SDK session state."""
+
+        from trpc_agent_sdk.agents import LlmAgent as SdkLlmAgent
+        from trpc_agent_sdk.configs import ModelRetryConfig
+        from trpc_agent_sdk.models import OpenAIModel
+        from trpc_agent_sdk.runners import Runner as SdkRunner
+        from trpc_agent_sdk.sessions import InMemorySessionService
+        from trpc_agent_sdk.types import GenerateContentConfig
+
+        max_output_tokens = self.release.model_config.get("max_output_tokens")
+        generation_kwargs: dict[str, Any] = {}
+        if isinstance(max_output_tokens, int) and not isinstance(max_output_tokens, bool):
+            if max_output_tokens < 1:
+                raise ReleaseConfigError("max_output_tokens must be positive")
+            generation_kwargs["max_output_tokens"] = max_output_tokens
+        model = OpenAIModel(
+            model_name=self._model_name,
+            api_key=self._api_key,
+            base_url=self._base_url,
+            generate_content_config=GenerateContentConfig(**generation_kwargs),
+            # The platform reserves an upper bound once per fenced execution;
+            # invisible SDK retries would otherwise undermine that accounting.
+            model_retry_config=ModelRetryConfig(num_retries=0),
+        )
+        system_prompt = str(
+            self.release.app_config.get("system_prompt", "You are a safe tenant-scoped assistant.")
+        )
+        agent = SdkLlmAgent(
+            name=self.release.agent_id,
+            model=model,
+            instruction=f"{system_prompt}\n\n{_safe_context(context)}",
+            tools=self._sdk_tools(),
+            add_name_to_instruction=False,
+        )
+        runner = SdkRunner(
+            app_name=f"trpc-platform-{self.release.tenant_id}",
+            agent=agent,
+            session_service=InMemorySessionService(),
+            # Platform commit produces the durable summary and memory intent;
+            # never run SDK post-turn persistence into an unrelated store.
+            enable_post_turn_processing=False,
+        )
+        return runner, model, agent, context
+
+    @staticmethod
+    def _usage(event: Any) -> tuple[int, int]:
+        usage = getattr(event, "usage_metadata", None)
+        if usage is None:
+            return 0, 0
+        return (
+            int(getattr(usage, "prompt_token_count", 0) or 0),
+            int(getattr(usage, "candidates_token_count", 0) or 0),
+        )
+
+    async def stream(
+        self, content: Content, context: Mapping[str, Any]
+    ) -> AsyncIterator[RunnerEvent]:
+        from trpc_agent_sdk.configs import RunConfig
+        from trpc_agent_sdk.types import Content as SdkContent
+        from trpc_agent_sdk.types import Part as SdkPart
+
+        runner, model, agent, _ = self._runner(context)
+        started = datetime.now(UTC)
+        yield RunnerEvent("runner.started", started, {"release_version": self.release.config_version})
+        latest_reply = ""
+        input_tokens = 0
+        output_tokens = 0
+        model_turn = 0
+        async for event in runner.run_async(
+            user_id="platform",
+            session_id="platform-execution",
+            new_message=SdkContent(role="user", parts=[SdkPart(text=content.text())]),
+            run_config=RunConfig(streaming=False, max_llm_calls=8, save_history_enabled=False),
+        ):
+            if getattr(event, "error_code", None):
+                raise RuntimeError(
+                    f"tRPC-Agent model error {event.error_code}: {getattr(event, 'error_message', '')}"
+                )
+            event_input, event_output = self._usage(event)
+            if event_input or event_output:
+                model_turn += 1
+                input_tokens += event_input
+                output_tokens += event_output
+                yield RunnerEvent(
+                    "model.completed",
+                    datetime.now(UTC),
+                    {
+                        "turn": model_turn,
+                        "model": getattr(model, "name", self._model_name),
+                        "input_tokens": event_input,
+                        "output_tokens": event_output,
+                        "tool_calls": len(event.get_function_calls()),
+                    },
+                )
+            for call in event.get_function_calls():
+                yield RunnerEvent(
+                    "tool.requested",
+                    datetime.now(UTC),
+                    {
+                        "tool_call_id": str(getattr(call, "id", "")),
+                        "tool_name": str(getattr(call, "name", "")),
+                        "arguments": dict(getattr(call, "args", {}) or {}),
+                    },
+                )
+            for response in event.get_function_responses():
+                yield RunnerEvent(
+                    "tool.completed",
+                    datetime.now(UTC),
+                    {
+                        "tool_name": str(getattr(response, "name", "")),
+                        "result": dict(getattr(response, "response", {}) or {}),
+                    },
+                )
+            text = event.get_text()
+            if text:
+                latest_reply = text
+        if not latest_reply:
+            raise RuntimeError("tRPC-Agent returned no assistant text")
+        yield RunnerEvent("reply.text", datetime.now(UTC), {"text": latest_reply})
+
+    async def run(self, content: Content, context: Mapping[str, Any]) -> AgentRun:
+        events = [event async for event in self.stream(content, context)]
+        reply = next(event for event in reversed(events) if event.kind == "reply.text")
+        model_events = [event for event in events if event.kind == "model.completed"]
+        return AgentRun(
+            events=tuple(events),
+            reply=Content(role="assistant", parts=(Part(text=str(reply.data["text"])),)),
+            usage={
+                "input_tokens": sum(int(event.data["input_tokens"]) for event in model_events),
+                "output_tokens": sum(int(event.data["output_tokens"]) for event in model_events),
+            },
+            model=(
+                str(model_events[-1].data["model"])
+                if model_events
+                else self._model_name
+            ),
+        )
+
+
 class AgentRuntime:
     """An immutable Agent and Runner pair bound to exactly one release snapshot."""
 
-    def __init__(self, release: ImmutableRelease, runner: Runner) -> None:
+    def __init__(self, release: ImmutableRelease, runner: Any) -> None:
         self.release = release
         self.runner = runner
 
@@ -456,6 +650,30 @@ class AgentFactory:
     async def build(
         self, release: ImmutableRelease, *, tools: Sequence[FunctionTool] = ()
     ) -> AgentRuntime:
+        mode = str(release.model_config.get("mode", "")).lower()
+        engine = str(release.model_config.get("engine", "")).lower()
+        use_sdk = (
+            not self._settings.mock_model
+            and mode != "mock"
+            and engine != "local"
+            and self.framework_module is not None
+        )
+        if mode == "trpc_agent" or engine == "trpc_agent":
+            if self.framework_module is None:
+                raise ReleaseConfigError("release requires trpc-agent-py but it is not installed")
+            use_sdk = True
+        if use_sdk:
+            api_key, base_url, model_name = await self._model_credentials(release)
+            return AgentRuntime(
+                release,
+                TrpcAgentSdkRunner(
+                    release,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model_name=model_name,
+                    tools=tools,
+                ),
+            )
         model = await self._model_for(release)
         return AgentRuntime(release, Runner(LlmAgent(release, model, tools)))
 
@@ -463,6 +681,15 @@ class AgentFactory:
         mode = str(release.model_config.get("mode", "")).lower()
         if self._settings.mock_model or mode == "mock":
             return DeterministicMockModel()
+        api_key, base_url, model_name = await self._model_credentials(release)
+        return OpenAICompatibleModel(
+            api_key=api_key,
+            base_url=base_url,
+            model_name=model_name,
+            timeout_seconds=float(release.model_config.get("timeout_seconds", 30)),
+        )
+
+    async def _model_credentials(self, release: ImmutableRelease) -> tuple[str, str, str]:
         api_key = self._settings.trpc_agent_api_key
         secret_ref = release.model_config.get("api_key_ref")
         if secret_ref:
@@ -471,15 +698,12 @@ class AgentFactory:
                     "release uses api_key_ref but no SecretProvider was configured"
                 )
             api_key = await self._secrets.get(str(secret_ref))
-        return OpenAICompatibleModel(
-            api_key=api_key or "",
-            base_url=str(
-                release.model_config.get("base_url") or self._settings.trpc_agent_base_url
-            ),
-            model_name=str(
-                release.model_config.get("model_name") or self._settings.trpc_agent_model_name
-            ),
-            timeout_seconds=float(release.model_config.get("timeout_seconds", 30)),
+        if not api_key:
+            raise ReleaseConfigError("a real model requires TRPC_AGENT_API_KEY or an api_key_ref")
+        return (
+            api_key,
+            str(release.model_config.get("base_url") or self._settings.trpc_agent_base_url),
+            str(release.model_config.get("model_name") or self._settings.trpc_agent_model_name),
         )
 
 
@@ -542,7 +766,7 @@ def _parse_tool_calls(raw_value: Any) -> tuple[ModelToolCall, ...]:
 def _try_import_trpc_agent() -> Any | None:
     """Detect either published Python module spelling without making mock mode depend on it."""
 
-    for module_name in ("trpc_agent", "trpc_agent_py"):
+    for module_name in ("trpc_agent_sdk", "trpc_agent", "trpc_agent_py"):
         try:
             return importlib.import_module(module_name)
         except ImportError:

@@ -839,6 +839,40 @@ class InMemoryRuntimeTransaction:
     def list_audit(self) -> list[AuditRecord]:
         return deepcopy(self._store._data.audits.get(self._tenant(), []))
 
+    def record_audit(
+        self,
+        decision: str,
+        audit_id: str,
+        *,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> AuditRecord:
+        """Append a redacted compliance fact outside a successful execution commit.
+
+        This is used for denials, failed executions, and outbound delivery
+        outcomes.  Callers may supply only the typed, allow-listed fields used
+        by ``_audit_fields``; raw channel/model payloads never reach the ledger.
+        """
+
+        if not decision or not audit_id:
+            raise ValueError("audit decision and audit_id are required")
+        audit = AuditRecord(
+            tenant_id=self._tenant(),
+            audit_id=audit_id,
+            decision=decision[:128],
+            trace_id=self.context.trace_id,
+            request_id=self.context.request_id,
+            session_id=session_id,
+            **_audit_fields(metadata or {}),
+            occurred_at=self._now(),
+        )
+        records = self._store._data.audits.setdefault(self._tenant(), [])
+        existing = next((item for item in records if item.audit_id == audit_id), None)
+        if existing is not None:
+            return deepcopy(existing)
+        records.append(audit)
+        return deepcopy(audit)
+
     def current_route(self) -> StorageRoute | None:
         state = self._store._data.states[self._tenant()]
         route = self._store._data.routes.get((state.tenant_id, state.routing_epoch))

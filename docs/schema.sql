@@ -539,3 +539,14 @@ CREATE TABLE audit_log_default PARTITION OF audit_log DEFAULT;
 -- FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
 
 CREATE INDEX audit_trace_idx ON audit_log (tenant_id, trace_id, occurred_at DESC);
+
+-- ``audit_log`` is partitioned by timestamp, so PostgreSQL requires its
+-- primary key to include ``occurred_at``.  This compact, unpartitioned gate
+-- makes a deterministic at-least-once audit fact append exactly once without
+-- granting workers read access to the audit ledger.
+CREATE TABLE audit_dedup (
+    tenant_id          text NOT NULL REFERENCES tenant(tenant_id),
+    audit_id           text NOT NULL,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, audit_id)
+);

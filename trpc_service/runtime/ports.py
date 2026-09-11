@@ -94,6 +94,15 @@ class RuntimeTransaction(Protocol):
 
     def list_audit(self) -> list[AuditRecord]: ...
 
+    def record_audit(
+        self,
+        decision: str,
+        audit_id: str,
+        *,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> AuditRecord: ...
+
     def current_route(self) -> StorageRoute | None: ...
 
     def initiate_migration(

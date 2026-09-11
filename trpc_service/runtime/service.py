@@ -244,6 +244,25 @@ class PlatformRuntime:
         with self.store.transaction(context) as tx:
             return tx.snapshot(include_audit=include_audit)
 
+    def record_audit(
+        self,
+        context: TenantContext,
+        decision: str,
+        audit_id: str,
+        *,
+        session_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ):
+        """Persist a redacted non-success audit fact in the tenant transaction."""
+
+        with self.store.transaction(context) as tx:
+            return tx.record_audit(
+                decision,
+                audit_id,
+                session_id=session_id,
+                metadata=dict(metadata or {}),
+            )
+
     def mark_outbox_delivered(self, context: TenantContext, outbox_id: str) -> None:
         with self.store.transaction(context) as tx:
             tx.mark_outbox_delivered(outbox_id)

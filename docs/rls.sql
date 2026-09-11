@@ -142,6 +142,7 @@ BEGIN
         'tool_execution',
         'delivery_attempt',
         'audit_log',
+        'audit_dedup',
         -- Partitions do not inherit ENABLE/FORCE RLS from their parent. The
         -- default audit partition must be protected against direct reads too.
         'audit_log_default'
@@ -178,7 +179,11 @@ GRANT SELECT, INSERT, UPDATE ON session, session_summary, memory,
     memory_projection, artifact, inbox, outbox, execution_attempt, budget_account,
     budget_reservation, tool_execution TO agent_worker;
 GRANT SELECT, INSERT ON session_event TO agent_worker;
-GRANT INSERT ON audit_log TO agent_worker;
+-- ``audit_dedup`` contains only deterministic audit IDs/timestamps. PostgreSQL
+-- requires SELECT to evaluate its ON CONFLICT key under RLS; this does not
+-- expose the audit ledger's compliance facts to workers.
+GRANT INSERT ON audit_log, audit_log_default TO agent_worker;
+GRANT SELECT, INSERT ON audit_dedup TO agent_worker;
 GRANT UPDATE (status, source_watermark, target_watermark, error, updated_at)
     ON storage_migration TO agent_worker;
 GRANT UPDATE (execution_mode, security_epoch, updated_at) ON tenant_runtime_state TO agent_worker;
@@ -191,7 +196,8 @@ GRANT SELECT, INSERT, UPDATE ON outbox, memory_projection, delivery_attempt,
     execution_attempt TO agent_dispatcher;
 GRANT SELECT, UPDATE ON budget_reservation TO agent_dispatcher;
 GRANT SELECT, UPDATE (reserved_units, version, updated_at) ON budget_account TO agent_dispatcher;
-GRANT INSERT ON audit_log TO agent_dispatcher;
+GRANT INSERT ON audit_log, audit_log_default TO agent_dispatcher;
+GRANT SELECT, INSERT ON audit_dedup TO agent_dispatcher;
 
 -- Admin is still tenant scoped. Cross-tenant jobs iterate one SET LOCAL scope at a time.
 GRANT INSERT, UPDATE ON tenant_locator TO agent_admin;
@@ -205,6 +211,8 @@ GRANT UPDATE (route_status, source_watermark, target_watermark, activated_at)
 GRANT UPDATE (status, target_routing_epoch, source_watermark, target_watermark, error, updated_at)
     ON storage_migration TO agent_admin;
 GRANT SELECT, INSERT ON audit_log TO agent_admin;
+GRANT INSERT ON audit_log_default TO agent_admin;
+GRANT SELECT, INSERT ON audit_dedup TO agent_admin;
 GRANT SELECT, INSERT, UPDATE ON tool_execution, delivery_attempt TO agent_admin;
 
 GRANT SELECT ON audit_log TO agent_auditor;

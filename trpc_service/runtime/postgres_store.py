@@ -1323,6 +1323,116 @@ class PostgresRuntimeTransaction:
             for row in rows
         ]
 
+    def record_audit(
+        self,
+        decision: str,
+        audit_id: str,
+        *,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> AuditRecord:
+        """Insert one redacted compliance fact, idempotently by ``audit_id``."""
+
+        if not decision or not audit_id:
+            raise ValueError("audit decision and audit_id are required")
+        now = _now()
+        audit = _audit_fields(metadata or {})
+        # ``audit_log`` is range-partitioned by timestamp, so its primary key
+        # must include the partition column and cannot deduplicate one audit
+        # fact across all partitions.  ``audit_dedup`` is a small unpartitioned
+        # tenant-scoped write gate.  Workload roles need INSERT only there; they
+        # never need SELECT access to the compliance ledger merely to retry one
+        # at-least-once worker event.
+        inserted = self.connection.execute(
+            """
+            INSERT INTO audit_dedup (tenant_id, audit_id, created_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (tenant_id, audit_id) DO NOTHING
+            """,
+            (self._tenant(), audit_id, now),
+        )
+        if inserted.rowcount == 0:
+            return AuditRecord(
+                tenant_id=self._tenant(),
+                audit_id=audit_id,
+                decision=decision[:128],
+                trace_id=self.context.trace_id,
+                request_id=self.context.request_id,
+                session_id=session_id,
+                **audit,
+                occurred_at=now,
+            )
+        row = self.connection.execute(
+            """
+            INSERT INTO audit_log
+            (tenant_id, audit_id, occurred_at, channel, subject_id, session_id, agent_name, tool_name,
+             decision, reason_code, policy_version, latency_ms, error_type, input_hash, output_hash,
+             token_in, token_out, cost_micros, trace_id, request_id, encrypted_detail_ref)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                self._tenant(),
+                audit_id,
+                now,
+                audit.get("channel"),
+                audit.get("subject_id"),
+                session_id,
+                audit.get("agent_name"),
+                audit.get("tool_name"),
+                decision[:128],
+                audit.get("reason_code"),
+                audit.get("policy_version"),
+                audit.get("latency_ms"),
+                audit.get("error_type"),
+                audit.get("input_hash"),
+                audit.get("output_hash"),
+                audit.get("token_in"),
+                audit.get("token_out"),
+                audit.get("cost_micros"),
+                self.context.trace_id,
+                self.context.request_id,
+                audit.get("encrypted_detail_ref"),
+            ),
+        )
+        if row.rowcount != 1:  # defensive: RLS/permissions must not silently drop audit writes.
+            raise RuntimeError("audit record was not persisted")
+        return AuditRecord(
+            tenant_id=self._tenant(),
+            audit_id=audit_id,
+            decision=decision[:128],
+            trace_id=self.context.trace_id,
+            request_id=self.context.request_id,
+            session_id=session_id,
+            **audit,
+            occurred_at=now,
+        )
+
+    @staticmethod
+    def list_audit_record(row: dict[str, Any]) -> AuditRecord:
+        return AuditRecord(
+            tenant_id=str(row["tenant_id"]),
+            audit_id=str(row["audit_id"]),
+            decision=str(row["decision"]),
+            trace_id=str(row["trace_id"]),
+            request_id=str(row["request_id"]),
+            session_id=row["session_id"],
+            reason_code=row["reason_code"],
+            channel=row["channel"],
+            subject_id=row["subject_id"],
+            agent_name=row["agent_name"],
+            tool_name=row["tool_name"],
+            policy_version=row["policy_version"],
+            latency_ms=row["latency_ms"],
+            error_type=row["error_type"],
+            input_hash=row["input_hash"],
+            output_hash=row["output_hash"],
+            token_in=row["token_in"],
+            token_out=row["token_out"],
+            cost_micros=row["cost_micros"],
+            encrypted_detail_ref=row["encrypted_detail_ref"],
+            occurred_at=row["occurred_at"],
+        )
+
     def current_route(self) -> StorageRoute | None:
         row = self.connection.execute(
             """
